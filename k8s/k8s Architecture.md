@@ -715,3 +715,23 @@ kube-proxy-7x9kp                   1/1     Running
 kube-scheduler-minikube            1/1     Running   
 storage-provisioner                1/1     Running   
 metrics-server-7746886d4f-tn2p8   1/1     Running
+---------------------------------------------------------------------------------------------------------
+You
+  │
+  ▼
+kubectl ──► API Server ──► etcd (stores everything)
+               │
+               ├──► Scheduler (assigns pods to nodes)
+               │
+               ├──► Controller Manager (watches & corrects state)
+               │         ├── ReplicaSet Controller
+               │         ├── Deployment Controller
+               │         └── Node Controller
+               │
+               └──► Each Worker Node
+                         ├── kubelet (runs containers)
+                         ├── kube-proxy (routes service traffic)
+                         └── Container Runtime (containerd)
+
+CoreDNS ──► resolves service names to IPs for all pods
+Metrics Server ──► feeds CPU/memory data to HPA
