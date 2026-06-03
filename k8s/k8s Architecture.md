@@ -1,197 +1,708 @@
-Kubernetes Architecture — Interview Answer Guide
+# Kubernetes Architecture — Interview Answer Guide
 
-Role: DevOps Engineer — 3.2 to 4 Years Experience
-Purpose: Copy this to GitHub as 01_Architecture.md
+**Role:** DevOps Engineer (3–4 Years Experience)
+**Purpose:** Interview Preparation + GitHub Portfolio Documentation
 
+---
 
-How to Use This File
+# How to Use This File
 
-Read Version 1 daily — until it flows naturally without thinking
-Practice Version 2 out loud — record yourself, listen back
-Study Version 3 for follow-up questions
-Never memorise word for word — understand the story, tell it in your own words
+### Version 1
 
+Read daily until the explanation flows naturally without memorization.
 
-Rule Before You Answer
-When interviewer says "Explain Kubernetes Architecture" — they are checking three things:
+### Version 2
 
-Do you understand the big picture or just memorised component names?
-Can you explain WHY each component exists, not just WHAT it is?
-Have you actually worked with it or just read about it?
+Practice speaking it aloud and record yourself.
 
-Golden rule: Always follow this structure:
+### Version 3
 
-Start with the purpose of Kubernetes
-Introduce the two sides — Control Plane and Worker Nodes
-Explain each component with what breaks when it dies
-End with a real flow from your banking project
+Study the deployment flow carefully because it is one of the most frequently asked Kubernetes interview questions.
 
+### Important Rule
 
-Version 1 — 60 Second Answer
+Never memorize answers word for word.
 
-Use this when interviewer says "give me a quick overview"
+Understand:
 
+* Why the component exists
+* What it does
+* What happens when it fails
+* How it behaves in production
 
-Kubernetes is a container orchestration platform — instead of manually managing servers, you declare what you want, like three replicas of a service, and Kubernetes makes it happen and keeps it that way automatically.
-The architecture has two sides — the Control Plane is the brain, and the Worker Nodes are where your applications actually run.
-The Control Plane has four components:
+Interviewers can easily identify memorized answers.
 
-API Server — single entry point for all requests
-etcd — distributed database storing all cluster state
-Scheduler — decides which node a pod runs on
-Controller Manager — runs background loops to keep actual state matching desired state
+---
 
+# Rule Before You Answer
 
-Each Worker Node has three components:
+When an interviewer asks:
 
-kubelet — agent that starts and manages containers
-kube-proxy — handles service traffic routing
-Container Runtime — containerd in modern clusters, actually runs the containers
+> "Explain Kubernetes Architecture"
 
+They are usually evaluating three things:
 
-Two supporting components keep everything working:
+### 1. Do you understand the big picture?
 
-CoreDNS — internal service discovery and DNS resolution
-Metrics Server — feeds CPU and memory data to the autoscaler
+Or are you simply listing component names?
 
+### 2. Do you know WHY each component exists?
 
-In my banking project at Atos, we ran this on AWS EKS — AWS manages the control plane completely, and we managed the worker node groups.
+Not just WHAT it does.
 
+### 3. Have you worked on Kubernetes?
 
-Version 2 — 3 Minute Deep Answer
+Or have you only studied theory?
 
-Use this in standard interviews — this is your main answer
+---
 
-Opening — Set the Context
+## Golden Structure
 
-Kubernetes follows a declared desired state model — you never say "go start this container on server 5."
-You say "I want 3 replicas of this payment service running" — Kubernetes figures out the rest, maintains it, and self-heals when something breaks.
-That mindset is the foundation of the entire architecture — everything exists to serve that promise.
+Always answer in this order:
 
+1. Explain the purpose of Kubernetes
+2. Introduce Control Plane and Worker Nodes
+3. Explain every component
+4. Explain what happens when it fails
+5. End with a real production example
 
-Part 1 — The Control Plane
+---
 
-The API Server is the single entry point for everything:
+# Version 1 — 60 Second Answer
 
-Every kubectl command goes through it
-Every internal component communicates through it
-Every CI/CD pipeline call goes through it
-It handles authentication, RBAC authorization, admission control, then persists state to etcd
-If API Server dies — you lose all control, but existing running pods are unaffected
+Use this when the interviewer asks for a quick overview.
 
+### Answer
 
-etcd is the distributed key-value store — the single source of truth:
+Kubernetes is a container orchestration platform that automates deployment, scaling, networking, and self-healing of containerized applications.
 
-Every deployment, pod definition, secret, and config is stored here
-In production we always run etcd as a 3 or 5 node cluster for high availability — odd numbers for Raft quorum
-Regular etcd backups are non-negotiable in a banking environment — if etcd is lost with no backup, entire cluster configuration is permanently gone
-If etcd dies — no changes can be made to the cluster, but existing pods keep running
+Instead of manually managing servers and containers, we declare the desired state, such as running three replicas of an application, and Kubernetes continuously ensures that desired state is maintained.
 
+The architecture consists of two major parts:
 
-The Scheduler watches for pods that have no node assigned yet:
+## Control Plane
 
-Step 1 — Filtering — removes nodes that cannot run the pod (insufficient CPU, taint mismatch, affinity rules not satisfied)
-Step 2 — Scoring — ranks remaining nodes by best fit
-Step 3 — Assigns pod to winning node by writing nodeName to etcd
-Important — Scheduler only makes the decision, it does not start the pod
-If Scheduler dies — existing pods keep running, new pods stay in Pending forever
+The Control Plane acts as the brain of the cluster.
 
+It contains:
 
-The Controller Manager runs the reconciliation loops:
+### API Server
 
-Most critical is the ReplicaSet Controller — constantly watches "you asked for 3 replicas, I see 2 running, creating one more"
-This loop is why Kubernetes self-heals — if a pod dies at 3am, no one needs to wake up
-Other important controllers — Deployment, Node, Endpoint, Job, CronJob, HPA
-If Controller Manager dies — self-healing stops, failed pods are not replaced
+* Entry point for all cluster operations
+* Receives requests from kubectl, CI/CD pipelines, and internal components
 
+### etcd
 
+* Distributed key-value database
+* Stores complete cluster state
 
+### Scheduler
 
-Part 2 — The Worker Nodes
+* Decides which worker node should run a Pod
 
-The kubelet is the agent on every worker node:
+### Controller Manager
 
-Receives pod assignments from the API Server
-Instructs the container runtime to pull images and start containers
-Runs liveness and readiness probes
-Reports pod status back to API Server continuously
-Critical fact — kubelet is NOT a pod, it runs as a systemd service directly on the node
-Troubleshoot with systemctl status kubelet and journalctl -u kubelet -f
+* Continuously compares desired state and actual state
+* Creates, deletes, or replaces resources as needed
 
+---
 
-kube-proxy handles service traffic routing on every node:
+## Worker Nodes
 
-Writes iptables rules so traffic to a Service ClusterIP reaches the correct pod IPs
-Without it — services stop routing traffic, applications cannot reach each other
-Does NOT handle pod-to-pod networking — that is the CNI plugin's job
+Worker nodes run application workloads.
 
+Each worker node contains:
 
-The Container Runtime — containerd in modern Kubernetes:
+### kubelet
 
-Actually creates and runs containers when kubelet instructs it
-Communicates with kubelet via the CRI (Container Runtime Interface)
-Docker is no longer the default — containerd is used directly
+* Node agent
+* Starts and manages containers
 
+### kube-proxy
 
+* Handles Service networking and traffic routing
 
+### Container Runtime
 
-Part 3 — Supporting Components
+* Usually containerd
+* Runs containers
 
-CoreDNS runs as a Deployment in the kube-system namespace:
+---
 
-Every service gets a DNS entry — service-name.namespace.svc.cluster.local
-Pods reach services by name — CoreDNS resolves the name to a ClusterIP
-If CoreDNS dies — pods can still talk by IP but all service-name based communication breaks, which is effectively everything in a microservices architecture
+## Supporting Components
 
+### CoreDNS
 
-Metrics Server collects CPU and memory from all nodes and pods:
+Provides internal DNS resolution.
 
-HPA depends entirely on it to make scaling decisions
-Powers kubectl top nodes and kubectl top pods
-If Metrics Server dies — HPA goes blind and shows <unknown> in targets
+### Metrics Server
 
+Provides CPU and memory metrics for autoscaling.
 
+---
 
+### Real Project Example
 
-Closing — Bring It to Your Project
+In my project, we used AWS EKS.
 
-In practice on AWS EKS at Atos:
+AWS managed the Control Plane components, while our team managed worker node groups, deployments, monitoring, networking, and application delivery.
 
-AWS manages the entire control plane — API Server, etcd, Scheduler, Controller Manager
-We never SSH into a control plane node — it is fully abstracted
-We managed worker node groups, configured IRSA for pod-level IAM permissions, and used EKS managed add-ons for CoreDNS, kube-proxy, and VPC CNI
-This matches how most enterprise Kubernetes is run today
+---
 
+# Version 2 — 3 Minute Deep Answer
 
+Use this as your primary interview answer.
 
+---
 
-Version 3 — When Interviewer Says "Walk Me Through a Deployment"
+## Opening
 
-This is the most common follow-up — know this sequence cold
+Kubernetes follows a desired-state model.
 
-When I run kubectl apply -f deployment.yaml — here is the exact sequence:
+Instead of telling Kubernetes:
 
-kubectl converts the YAML to a JSON HTTP request and sends it to the API Server on port 6443
-API Server receives the request and runs Authentication — validates my certificate or token
-API Server runs RBAC Authorization — checks if I have permission to create a Deployment in this namespace
-Request passes through Mutating Admission — webhooks can modify it, for example injecting resource limits automatically or adding an Istio sidecar container
-Object Schema Validation — API Server validates all required fields are present and values are correct types
-Validating Admission — final policy checks run, ResourceQuota validates the request will not exceed namespace limits
-Object is written to etcd — desired state is now officially stored, this is the point of no return
-Deployment Controller inside Controller Manager sees the new Deployment and creates a ReplicaSet object
-ReplicaSet Controller sees it needs 3 pods and creates 3 Pod objects in etcd — with no node assigned yet
-Scheduler sees 3 unscheduled pods, filters and scores nodes, writes node assignments to etcd
-kubelet on each assigned node sees a pod assigned to it, calls containerd to pull the image, starts the containers
-kubelet reports pod status back to API Server — pods show Running
-Endpoint Controller updates the Endpoints object with the new pod IPs
-kube-proxy updates iptables rules on all nodes so Service traffic correctly reaches the new pods
+> "Start this container on Server 5."
 
+We declare:
 
-From kubectl apply to pods running — typically under 30 seconds in a healthy cluster
+> "I want three replicas of this application."
 
+Kubernetes continuously works to make reality match the declared state.
 
-What NOT to Say — Common Mistakes
-❌ Avoid This✅ Say This Instead"Master node""Control Plane" — master is deprecated terminology"Docker runs the containers""containerd is the container runtime in modern Kubernetes"Listing components without connecting themAlways explain what breaks when each component dies"I read that Kubernetes...""In our banking project at Atos, we..."Stopping after listing componentsAlways end with a real flow or production scenario"I think the scheduler starts the pod""Scheduler only assigns — kubelet starts the pod"
+This principle is the foundation of Kubernetes architecture.
 
-Follow-Up Questions — Quick Reference
-Interviewer AsksKey Points in Your AnswerWhat happens if etcd goes down?No changes possible, existing pods keep running, need backup restoreHow is EKS different from self-managed K8s?AWS manages control plane, you manage node groups, IRSA for IAM, no etcd accessWhat is the reconciliation loop?Desired state vs actual state, controller closes the gap, runs foreverHow does a pod get scheduled?Filter nodes, score nodes, write nodeName, kubelet picks it upWhat are admission controllers?Mutating modifies the object, validating accepts or rejects, runs after AuthZ before etcdWhat is RBAC?Role defines what actions, RoleBinding defines who gets them, ClusterRole for cluster-wideDifference between taint and node affinity?Taint repels from the node side, affinity attracts from the pod sideWhat is the difference between kubelet and kube-proxy?kubelet runs containers, kube-proxy routes service trafficWhy does etcd use odd numbers?Raft consensus needs majority quorum — 3 nodes tolerates 1 failure, 5 nodes tolerates 2
+---
+
+# Part 1 — Control Plane
+
+The Control Plane is responsible for managing the cluster.
+
+---
+
+## API Server
+
+The API Server is the central communication hub.
+
+Every operation goes through it:
+
+* kubectl commands
+* CI/CD deployments
+* Internal Kubernetes components
+
+### Responsibilities
+
+* Authentication
+* Authorization (RBAC)
+* Admission Control
+* API Validation
+* Persisting data to etcd
+
+### Failure Scenario
+
+If the API Server becomes unavailable:
+
+* No new deployments
+* No scaling
+* No updates
+
+However:
+
+Existing Pods continue running because they already exist on worker nodes.
+
+---
+
+## etcd
+
+etcd is Kubernetes' source of truth.
+
+Everything is stored here:
+
+* Deployments
+* Pods
+* Services
+* Secrets
+* ConfigMaps
+* Node information
+
+### High Availability
+
+Production environments typically use:
+
+* 3-node cluster
+* 5-node cluster
+
+Odd numbers are required for quorum.
+
+### Failure Scenario
+
+If etcd fails:
+
+* Cluster state becomes unavailable
+* No configuration changes can occur
+* Existing Pods continue running
+
+### Production Best Practice
+
+Regular etcd backups are mandatory.
+
+Without backups, cluster recovery may be impossible.
+
+---
+
+## Scheduler
+
+The Scheduler determines where Pods should run.
+
+### Scheduling Process
+
+### Step 1 — Filtering
+
+Remove nodes that cannot run the Pod.
+
+Examples:
+
+* Insufficient CPU
+* Insufficient memory
+* Taints
+* Affinity constraints
+
+### Step 2 — Scoring
+
+Rank remaining nodes.
+
+### Step 3 — Binding
+
+Assign Pod to the best node.
+
+### Important Interview Point
+
+Scheduler does not start Pods.
+
+It only assigns a node.
+
+### Failure Scenario
+
+If Scheduler fails:
+
+* Existing Pods continue running
+* New Pods remain Pending
+
+---
+
+## Controller Manager
+
+Controller Manager continuously runs reconciliation loops.
+
+Its job:
+
+Compare:
+
+Desired State
+
+vs
+
+Actual State
+
+### Example
+
+Desired Replicas = 3
+
+Actual Replicas = 2
+
+Controller Manager creates one more Pod.
+
+### Important Controllers
+
+* Deployment Controller
+* ReplicaSet Controller
+* Node Controller
+* Endpoint Controller
+* Job Controller
+* CronJob Controller
+
+### Failure Scenario
+
+If Controller Manager fails:
+
+* Self-healing stops
+* Failed Pods are not recreated
+* Scaling activities stop
+
+---
+
+# Part 2 — Worker Nodes
+
+Worker nodes execute workloads.
+
+---
+
+## kubelet
+
+kubelet is the primary node agent.
+
+Responsibilities:
+
+* Receives Pod assignments
+* Pulls container images
+* Starts containers
+* Executes health probes
+* Reports status to API Server
+
+### Important Interview Point
+
+kubelet is not a Pod.
+
+It runs as a system service.
+
+### Troubleshooting
+
+```bash
+systemctl status kubelet
+
+journalctl -u kubelet -f
+```
+
+### Failure Scenario
+
+Node eventually becomes NotReady.
+
+Controller Manager schedules replacement Pods elsewhere.
+
+---
+
+## kube-proxy
+
+kube-proxy handles Service networking.
+
+Responsibilities:
+
+* Creates iptables/IPVS rules
+* Routes Service traffic
+* Enables ClusterIP communication
+
+### Important Interview Point
+
+kube-proxy does NOT handle Pod networking.
+
+That is the responsibility of the CNI plugin.
+
+### Failure Scenario
+
+Services stop routing traffic correctly.
+
+---
+
+## Container Runtime
+
+Modern Kubernetes primarily uses:
+
+* containerd
+
+Responsibilities:
+
+* Pull images
+* Create containers
+* Run containers
+
+Communication occurs through:
+
+CRI (Container Runtime Interface)
+
+### Important Interview Point
+
+Docker is no longer the default runtime.
+
+containerd is used directly.
+
+---
+
+# Part 3 — Supporting Components
+
+---
+
+## CoreDNS
+
+Runs inside the kube-system namespace.
+
+Provides internal DNS resolution.
+
+Example:
+
+```text
+payment-service.default.svc.cluster.local
+```
+
+### Failure Scenario
+
+Pods can communicate using IP addresses.
+
+Service-name-based communication fails.
+
+In microservices environments, this causes major outages.
+
+---
+
+## Metrics Server
+
+Collects:
+
+* CPU Metrics
+* Memory Metrics
+
+Used by:
+
+* HPA
+* kubectl top nodes
+* kubectl top pods
+
+### Failure Scenario
+
+Autoscaling stops functioning correctly.
+
+HPA displays:
+
+```text
+<unknown>
+```
+
+---
+
+# Closing — Production Example
+
+In AWS EKS:
+
+AWS manages:
+
+* API Server
+* etcd
+* Scheduler
+* Controller Manager
+
+Our team manages:
+
+* Worker Nodes
+* IAM Roles for Service Accounts (IRSA)
+* Monitoring
+* Logging
+* Deployments
+* Networking
+* Security
+
+This architecture is commonly used across enterprise environments.
+
+---
+
+# Version 3 — Walk Me Through a Deployment
+
+One of the most common Kubernetes interview questions.
+
+---
+
+## Scenario
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+### Step 1
+
+kubectl converts YAML into an HTTP request.
+
+### Step 2
+
+Request reaches API Server.
+
+### Step 3
+
+Authentication occurs.
+
+Certificate or token validation.
+
+### Step 4
+
+RBAC Authorization occurs.
+
+Permission checks are performed.
+
+### Step 5
+
+Mutating Admission Controllers execute.
+
+Examples:
+
+* Inject sidecars
+* Add labels
+* Apply defaults
+
+### Step 6
+
+Schema validation occurs.
+
+Required fields are verified.
+
+### Step 7
+
+Validating Admission Controllers execute.
+
+Examples:
+
+* ResourceQuota
+* Security Policies
+
+### Step 8
+
+Deployment object is stored in etcd.
+
+Desired state now exists.
+
+### Step 9
+
+Deployment Controller creates a ReplicaSet.
+
+### Step 10
+
+ReplicaSet Controller creates Pod objects.
+
+### Step 11
+
+Scheduler assigns nodes.
+
+### Step 12
+
+kubelet detects assigned Pods.
+
+### Step 13
+
+containerd pulls images.
+
+### Step 14
+
+Containers start.
+
+### Step 15
+
+Pod status updates to Running.
+
+### Step 16
+
+Endpoint Controller updates Service endpoints.
+
+### Step 17
+
+kube-proxy updates networking rules.
+
+### Result
+
+Application becomes reachable through Kubernetes Services.
+
+---
+
+# Common Interview Mistakes
+
+| Avoid Saying              | Say Instead                                     |
+| ------------------------- | ----------------------------------------------- |
+| Master Node               | Control Plane                                   |
+| Docker runs containers    | containerd runs containers in modern Kubernetes |
+| Listing components only   | Explain purpose and failure impact              |
+| I read that Kubernetes... | In my project we implemented...                 |
+| Scheduler starts Pods     | Scheduler only assigns nodes                    |
+
+---
+
+# Quick Follow-Up Questions
+
+## What happens if etcd goes down?
+
+* No cluster changes possible
+* Existing Pods continue running
+* Restore from backup required
+
+---
+
+## What is the reconciliation loop?
+
+Continuous comparison between:
+
+Desired State
+
+and
+
+Actual State
+
+Controllers close the gap automatically.
+
+---
+
+## How does scheduling work?
+
+1. Filter nodes
+2. Score nodes
+3. Assign node
+4. kubelet starts Pod
+
+---
+
+## What are Admission Controllers?
+
+### Mutating
+
+Modify requests.
+
+### Validating
+
+Approve or reject requests.
+
+---
+
+## What is RBAC?
+
+RBAC controls access to Kubernetes resources.
+
+### Role
+
+Defines permissions.
+
+### RoleBinding
+
+Assigns permissions.
+
+### ClusterRole
+
+Cluster-wide permissions.
+
+---
+
+## Difference Between Taints and Affinity
+
+### Taints
+
+Push Pods away from nodes.
+
+### Affinity
+
+Pull Pods toward nodes.
+
+---
+
+## Difference Between kubelet and kube-proxy
+
+### kubelet
+
+Runs and manages containers.
+
+### kube-proxy
+
+Routes Service traffic.
+
+---
+
+## Why does etcd use odd numbers?
+
+Raft consensus requires majority quorum.
+
+Examples:
+
+* 3 nodes tolerate 1 failure
+* 5 nodes tolerate 2 failures
+
+Using even numbers provides no additional fault tolerance while increasing resource usage.
