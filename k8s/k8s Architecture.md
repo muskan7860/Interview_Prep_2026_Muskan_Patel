@@ -735,3 +735,410 @@ kubectl ──► API Server ──► etcd (stores everything)
 
 CoreDNS ──► resolves service names to IPs for all pods
 Metrics Server ──► feeds CPU/memory data to HPA
+---------------------------------------------------------------------------------------
+# Kubernetes Core Components — Deep Dive Interview Notes
+
+## kube-apiserver
+
+### What it is
+
+The front door of the entire cluster. Every single thing — kubectl commands, internal components, external tools — all communicate through the API server. Nothing bypasses it.
+
+### What it does in production
+
+Receives your kubectl apply, validates the YAML, checks your permissions via RBAC, then writes the desired state into etcd. It also serves as the communication hub — controller manager watches it, scheduler watches it, kubelet reports to it.
+
+### What happens if it dies
+
+You lose all control of the cluster. Cannot deploy, scale, delete, or view anything via kubectl. But — and this is important for interviews — existing running pods continue running because kubelet keeps them alive independently.
+
+### Interview question
+
+**How do you check if the API server is healthy?**
+
+```bash
+kubectl get componentstatuses
+
+kubectl get pod kube-apiserver-minikube -n kube-system
+```
+
+---
+
+# etcd
+
+### What it is
+
+A distributed key-value database. The single source of truth for everything in your cluster — every pod definition, every service, every secret, every config.
+
+### What it does in production
+
+When API server writes "user wants 3 replicas of app X", that gets stored in etcd. When controller manager asks "what is the desired state", it reads from etcd. Everything in Kubernetes is just reading and writing to etcd.
+
+### Critical production fact
+
+In production clusters, etcd runs as a 3-node or 5-node cluster (always odd numbers) for high availability. It uses the Raft consensus algorithm — majority of nodes must agree before a write is accepted. With 3 nodes, you can lose 1. With 5 nodes, you can lose 2.
+
+### Backup is mandatory
+
+```bash
+etcdctl snapshot save backup.db
+```
+
+Run this regularly. If etcd data is lost with no backup, your cluster configuration is permanently gone.
+
+### What happens if it dies
+
+API server cannot read or write state. Cluster management completely stops. Existing pods still run.
+
+### Interview question
+
+**Why does etcd use odd numbers of nodes?**
+
+Because of Raft consensus — you need a majority (quorum) to agree. With 3 nodes, quorum = 2. With 4 nodes, quorum is still 3 — you get no extra fault tolerance over 3 nodes but have more complexity. Odd numbers give maximum fault tolerance per node added.
+
+---
+
+# kube-scheduler
+
+### What it is
+
+The component that decides which worker node a new pod runs on.
+
+### What it does step by step
+
+1. Watches for pods that have no node assigned yet (nodeName is empty)
+2. Runs filtering — removes nodes that cannot run the pod (not enough CPU, wrong OS, has a taint the pod cannot tolerate)
+3. Runs scoring — ranks remaining nodes (prefers node with most free resources, spreads pods across nodes for availability)
+4. Assigns the pod to the highest scoring node by writing the nodeName into etcd
+
+### What it does NOT do
+
+It does not start the pod. It only decides where it goes. The kubelet on that node does the actual starting.
+
+### What happens if it dies
+
+Existing pods keep running. But any new pods that need scheduling will sit in Pending state forever — because nothing is assigning them to nodes.
+
+### Interview question
+
+**A pod is stuck in Pending. Could the scheduler be the cause?**
+
+Yes — if the scheduler is down, or if no node passes the filtering phase (insufficient resources, taint mismatch, node selector mismatch).
+
+Check:
+
+```bash
+kubectl describe pod <pod-name>
+```
+
+The Events section will say:
+
+```text
+no nodes available to schedule pods
+```
+
+or similar.
+
+---
+
+# kube-controller-manager
+
+### What it is
+
+A single binary that runs multiple controllers — each controller is a background loop that watches the cluster state and corrects it when reality does not match the desired state.
+
+### The controllers inside it that matter for interviews
+
+#### Deployment Controller
+
+Watches Deployment objects. When you create a Deployment, it creates a ReplicaSet.
+
+#### ReplicaSet Controller
+
+Watches ReplicaSet objects. Makes sure the correct number of pods are running at all times. If a pod dies, this controller creates a replacement immediately.
+
+#### Node Controller
+
+Watches node health. If a node stops sending heartbeats, it marks it NotReady. After a timeout (default 5 minutes), it evicts pods from that node.
+
+#### Job Controller
+
+Watches Job objects and creates pods to run them. Marks Job complete when pods finish successfully.
+
+#### Endpoint Controller
+
+Watches Services and Pods. When pod IPs change, it updates the Endpoints object so traffic routes correctly.
+
+### What happens if it dies
+
+Existing pods keep running. But self-healing stops — if a pod dies, no replacement is created. Node failures are not handled. HPA stops scaling.
+
+### Interview question
+
+**What is the reconciliation loop?**
+
+Every controller runs an infinite loop:
+
+```text
+observe current state
+        ↓
+compare with desired state
+        ↓
+take action to fix any difference
+```
+
+This is the core pattern of Kubernetes. The system is always trying to make reality match what you declared.
+
+---
+
+# kubelet
+
+### What it is
+
+An agent that runs on every worker node. It is the only Kubernetes component that actually runs containers.
+
+### What it does
+
+* Watches the API server for pods assigned to its node
+* Pulls the container image via the container runtime (containerd)
+* Creates and starts the containers
+* Runs liveness and readiness probes
+* Reports pod status back to API server continuously
+* Manages pod lifecycle — restarts containers on failure based on restartPolicy
+
+### Critical fact
+
+kubelet is the only component that does not run as a pod. It runs directly as a systemd service on the node.
+
+This is why you check it with:
+
+```bash
+systemctl status kubelet
+```
+
+not:
+
+```bash
+kubectl get pods
+```
+
+### What happens if it dies
+
+The node stops reporting to the control plane. Existing containers on that node keep running (because the container runtime is still alive) but Kubernetes has no visibility into them. The node eventually goes NotReady.
+
+### Interview question
+
+**How do you troubleshoot kubelet on a node?**
+
+```bash
+systemctl status kubelet
+
+journalctl -u kubelet -f --since "10 minutes ago"
+```
+
+Look for:
+
+* Certificate errors
+* API server connection issues
+* Disk pressure errors
+
+---
+
+# kube-proxy
+
+### What it is
+
+A network component that runs on every node. It handles traffic routing for Kubernetes Services.
+
+### What it does
+
+When you create a Service with ClusterIP 10.96.0.1 pointing to pods on 10.244.1.5 and 10.244.2.7, kube-proxy writes iptables rules (or IPVS rules) on every node so that traffic to 10.96.0.1 gets load-balanced to the actual pod IPs.
+
+### Important distinction
+
+kube-proxy does NOT handle pod-to-pod networking.
+
+That is the job of the CNI plugin (Calico, Flannel, etc.).
+
+kube-proxy only handles Service-to-pod routing.
+
+### What happens if it dies
+
+Pods can still talk to each other directly by IP. But Service DNS names stop working — traffic to any Service stops being routed correctly. Applications that use service names to communicate (which is almost all of them) will start failing.
+
+### Interview question
+
+**What is the difference between kube-proxy and a CNI plugin?**
+
+**CNI plugin**
+
+* Pod networking
+* How pods get IPs
+* How pod-to-pod traffic flows
+
+**kube-proxy**
+
+* Service networking
+* How traffic to a Service ClusterIP gets routed to the right pods
+
+Both are needed for a fully functional cluster.
+
+---
+
+# coredns
+
+### What it is
+
+The DNS server for the entire cluster. Runs as a Deployment (usually 2 replicas for HA) in kube-system namespace.
+
+### What it does
+
+When a pod inside the cluster does:
+
+```bash
+curl http://my-service
+```
+
+it needs to resolve my-service to an IP address.
+
+CoreDNS handles that.
+
+It knows about every Service in the cluster and returns the ClusterIP for that service name.
+
+### DNS format in Kubernetes
+
+```text
+<service-name>.<namespace>.svc.cluster.local
+```
+
+Example:
+
+```text
+payment-service.banking.svc.cluster.local
+```
+
+Within the same namespace, just:
+
+```text
+payment-service
+```
+
+works.
+
+### What happens if it dies
+
+Internal DNS resolution breaks.
+
+Pods cannot reach services by name — only by IP.
+
+Almost all applications use service names, so this effectively breaks inter-service communication across the cluster.
+
+### Interview question
+
+**A pod cannot reach another service by name but can reach it by IP. What do you check?**
+
+CoreDNS is the first suspect.
+
+Check:
+
+```bash
+kubectl get pods -n kube-system | grep coredns
+```
+
+Test DNS:
+
+```bash
+kubectl exec -it <pod> -- nslookup <service-name>
+```
+
+Check logs:
+
+```bash
+kubectl logs -n kube-system <coredns-pod>
+```
+
+---
+
+# metrics-server
+
+### What it is
+
+A lightweight component that collects CPU and memory usage from all nodes and pods in real time.
+
+### What it does
+
+Scrapes resource usage from kubelet on every node every 15 seconds.
+
+Stores it in memory (not persistent).
+
+Exposes it via the Kubernetes Metrics API.
+
+### Why it matters
+
+HPA (Horizontal Pod Autoscaler) depends entirely on metrics-server to know current CPU usage before deciding to scale.
+
+These commands also depend on it:
+
+```bash
+kubectl top nodes
+
+kubectl top pods
+```
+
+### What happens if it dies
+
+kubectl top commands fail.
+
+HPA stops scaling — it shows:
+
+```text
+<unknown>
+```
+
+in the TARGETS column.
+
+Cluster still works but autoscaling is blind.
+
+### Interview question
+
+**HPA is not scaling even though CPU is high. What do you check first?**
+
+Check:
+
+```bash
+kubectl get pods -n kube-system | grep metrics-server
+```
+
+Then:
+
+```bash
+kubectl get hpa
+```
+
+If TARGETS shows:
+
+```text
+<unknown>/50%
+```
+
+metrics-server is the problem.
+
+---
+
+# storage-provisioner (minikube specific)
+
+### What it is
+
+In minikube, this is a built-in component that automatically creates PersistentVolumes when a PersistentVolumeClaim is created.
+
+In real AWS clusters, this role is played by the EBS CSI Driver.
+
+### What it does
+
+Watches for PVCs with no bound PV.
+
+Creates a PV automatically on:
+
+* Host filesystem (Minikube)
+* Amazon EBS (AWS)
+
