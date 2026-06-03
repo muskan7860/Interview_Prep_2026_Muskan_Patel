@@ -706,3 +706,12 @@ Examples:
 * 5 nodes tolerate 2 failures
 
 Using even numbers provides no additional fault tolerance while increasing resource usage.
+NAME                               READY   STATUS    
+coredns-5d78c9869d-xkj2p          1/1     Running   
+etcd-minikube                      1/1     Running   
+kube-apiserver-minikube            1/1     Running   
+kube-controller-manager-minikube   1/1     Running   
+kube-proxy-7x9kp                   1/1     Running   
+kube-scheduler-minikube            1/1     Running   
+storage-provisioner                1/1     Running   
+metrics-server-7746886d4f-tn2p8   1/1     Running
