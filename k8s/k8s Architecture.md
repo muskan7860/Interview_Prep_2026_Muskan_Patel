@@ -705,7 +705,6 @@ Examples:
 * 3 nodes tolerate 1 failure
 * 5 nodes tolerate 2 failures
 
-Using even numbers provides no additional fault tolerance while increasing resource usage.
 NAME                               READY   STATUS    
 coredns-5d78c9869d-xkj2p          1/1     Running   
 etcd-minikube                      1/1     Running   
