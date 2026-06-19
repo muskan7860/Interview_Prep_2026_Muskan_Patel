@@ -1,0 +1,511 @@
+# StatefulSet — Interview Questions
+
+> Level: 4 Years Experience
+> Author: Muskan Patel
+> Covers: Theory, Scenario, Troubleshooting
+
+---
+
+## HIGH PRIORITY — Almost Guaranteed to Be Asked
+
+---
+
+**Q1. What is a StatefulSet and why does it exist?**
+
+A StatefulSet is a Kubernetes workload controller designed for
+applications that need stable, persistent identity across pod
+restarts — specifically: a stable pod NAME that never changes, a
+stable STORAGE volume dedicated to each replica individually, and
+a guaranteed CREATION ORDER. It exists because Deployment treats
+pods as interchangeable clones (random names, no dedicated storage,
+no ordering) which is completely fine for stateless apps but
+fundamentally broken for stateful ones like databases, where each
+replica needs its own data and a predictable address that other
+replicas can connect to reliably.
+
+---
+
+**Q2. What are the three core guarantees StatefulSet provides that Deployment does not?**
+
+1. **Stable network identity** — pods get predictable, ordinal-based
+   names (`postgres-0`, `postgres-1`, `postgres-2`) that NEVER change
+   across restarts, unlike Deployment's random suffixes. Combined with
+   a headless Service, each pod gets its own stable DNS name.
+
+2. **Stable dedicated storage** — via `volumeClaimTemplates`, each
+   pod gets its OWN separate PersistentVolumeClaim (`data-postgres-0`,
+   `data-postgres-1`, etc.) that is REATTACHED to the replacement pod
+   if the original is deleted. The PVC is never deleted when a pod is
+   deleted.
+
+3. **Ordered creation and deletion** — pods are created one at a time
+   in ascending ordinal order (0, then 1, then 2), each waiting for
+   the previous to be Running AND Ready before the next starts. Deletion
+   goes in the exact reverse order (highest ordinal first, lowest last).
+
+---
+
+**Q3. What is a Headless Service and why does StatefulSet require one?**
+
+A normal Service gets ONE shared virtual IP (ClusterIP) and
+load-balances traffic randomly across all matching pods. For a
+StatefulSet, you often need to address `postgres-0` SPECIFICALLY
+(the primary database), not "any random one of the three." A headless
+Service sets `clusterIP: None`, which tells CoreDNS: instead of
+returning one shared IP, return the INDIVIDUAL IP of each matching
+pod via a per-pod DNS record:
+
+```
+postgres-0.postgres-headless.default.svc.cluster.local -> IP of postgres-0
+postgres-1.postgres-headless.default.svc.cluster.local -> IP of postgres-1
+postgres-2.postgres-headless.default.svc.cluster.local -> IP of postgres-2
+```
+
+The `serviceName` field in the StatefulSet spec links it to this
+headless Service, which is what causes CoreDNS to generate these
+individual pod DNS records automatically.
+
+---
+
+**Q4. What is `volumeClaimTemplates` and how is it different from using a normal `volumes:` field with a PVC?**
+
+`volumes:` with a `persistentVolumeClaim` reference in a Deployment
+or StatefulSet spec points ALL pods at the SAME single pre-existing
+PVC — every replica mounts the exact same disk. For a database, this
+means multiple processes writing to the same data files simultaneously,
+causing instant corruption (and most storage backends block it with
+`ReadWriteOnce` mode, leaving pods stuck in `ContainerCreating`
+anyway).
+
+`volumeClaimTemplates` is a StatefulSet-specific field that creates
+a SEPARATE, DEDICATED PVC for each pod ordinal automatically —
+`data-postgres-0`, `data-postgres-1`, `data-postgres-2`. Each pod
+only ever mounts its own PVC. When a pod is deleted and recreated,
+its own PVC is REATTACHED (not recreated), so all data is preserved.
+
+---
+
+**Q5. A very common mistake: someone adds `volumeClaimTemplates` to their StatefulSet, sees PVCs created and `Bound`, but data is still lost every time a pod restarts. What went wrong?**
+
+`volumeClaimTemplates` only PROVISIONS the storage (creates and binds
+the PVC). It does NOT automatically mount it into the container. For
+data to actually persist, you MUST also add a matching `volumeMounts`
+entry in the container spec, pointing the application's data directory
+AT that PVC:
+
+```yaml
+spec:
+  containers:
+  - name: postgres
+    volumeMounts:
+    - name: data                          # must match volumeClaimTemplates name
+      mountPath: /var/lib/postgresql/data # actual path the app writes to
+volumeClaimTemplates:
+- metadata:
+    name: data
+```
+
+Without `volumeMounts`, the container writes to its own EPHEMERAL
+filesystem layer (which is wiped on restart), while the PVC sits
+there `Bound` but completely unused. `kubectl get pvc` looks healthy,
+data disappears on every restart — a dangerous false sense of safety.
+This is one of the most common real-world StatefulSet mistakes.
+
+---
+
+**Q6. You delete `postgres-0`. Walk through exactly what happens step by step.**
+
+1. StatefulSet controller detects `postgres-0` no longer exists.
+2. It recreates the pod with the EXACT SAME NAME, `postgres-0` —
+   not a random new name.
+3. Before starting the pod, it checks: does PVC `data-postgres-0`
+   already exist? YES — deleting a pod does NOT delete its PVC.
+4. It REATTACHES the existing `data-postgres-0` PVC to the new
+   `postgres-0` pod.
+5. From the application's perspective, it's as if the process simply
+   restarted — all data files are right where they were, because it
+   is literally the same underlying disk.
+
+The pod's NAME and STORAGE are preserved. The pod's IP ADDRESS is NOT
+preserved — the new `postgres-0` will have a different IP than the
+old one. This is why StatefulSet workloads are addressed by DNS name
+(`postgres-0.postgres-headless...`) rather than by IP.
+
+---
+
+**Q7. Does StatefulSet decide which pod is the "primary" database and which are "replicas"? Explain.**
+
+No — StatefulSet has ZERO understanding of primary/replica database
+roles. Its only job is stable name, stable storage, and ordered
+creation. The APPLICATION decides roles, typically using the pod's
+`$HOSTNAME` environment variable, which inside a StatefulSet pod is
+ALWAYS the exact pod name (`postgres-0`, `postgres-1`, etc.):
+
+```yaml
+command:
+- sh
+- -c
+- |
+  if [ "$HOSTNAME" = "postgres-0" ]; then
+    echo "Starting as PRIMARY"
+    exec postgres -c wal_level=replica
+  else
+    echo "Starting as REPLICA -- syncing from postgres-0"
+    exec postgres -c hot_standby=on
+  fi
+```
+
+In real production, this logic is rarely hand-written. Teams use
+tools like Patroni (which performs leader election dynamically,
+similar to `--leader-elect=true` on controller-manager) so that if
+`postgres-0` crashes, Patroni promotes `postgres-1` to primary
+automatically — true failover that doesn't depend on a hardcoded
+ordinal being the "permanent" primary.
+
+---
+
+**Q8. What is `podManagementPolicy` and what are its two options?**
+
+`podManagementPolicy` controls whether pods are created/deleted in
+strict sequential order or all at once.
+
+- `OrderedReady` (default) — strictly sequential, blocking. Pods are
+  created one at a time (ordinal 0, then 1, then 2), each waiting
+  for the previous to be Running AND Ready before the next starts.
+  Deletion goes in reverse order (highest first, lowest last). Used
+  when application bootstrap requires ordering — e.g., database
+  replicas that need to connect to the primary on startup.
+
+- `Parallel` — all pods created or deleted simultaneously, no waiting
+  for any specific pod. Used when the application is designed so any
+  node can join/leave in any order (e.g., Cassandra, which handles
+  cluster membership dynamically regardless of join order).
+
+---
+
+## THEORY QUESTIONS
+
+---
+
+**Q9. What is the naming pattern for StatefulSet pods vs ReplicaSet pods? Why the difference?**
+
+StatefulSet pods get SEQUENTIAL, PREDICTABLE ordinal-based names:
+`<statefulset-name>-0`, `<statefulset-name>-1`, etc. This
+predictability is the foundation of stable identity — application
+code can hardcode logic like "if my hostname is postgres-0, I am the
+primary" and it will ALWAYS be true across restarts.
+
+ReplicaSet pods get a RANDOM 5-character suffix: `payment-rs-x7k2p`.
+This is intentional — ReplicaSet pods are INTERCHANGEABLE, so giving
+them any specific "identity" would be misleading and wrong. The
+randomness signals "this pod has no special role, it's just one of N
+identical copies."
+
+---
+
+**Q10. When StatefulSet scales DOWN (e.g., from 3 to 1 replicas), what is the deletion order and why?**
+
+Pods are deleted in REVERSE ordinal order — highest first, lowest
+last. With 3 replicas scaling down to 1: `postgres-2` is deleted
+first, then `postgres-1`, and `postgres-0` is deleted last (or
+preserved if scaling to 1).
+
+The reason is the use-case StatefulSet was designed for: ordinal 0 is
+conventionally the "seed"/foundational member — often the primary in
+a database cluster. Removing it while higher-ordinal replicas still
+exist would leave replicas pointing at a non-existent primary. By
+deleting from the edges inward, the most established member survives
+the longest, ensuring the remaining pods can still reference it.
+
+---
+
+**Q11. Is a StatefulSet pod's IP address stable across restarts?**
+
+No — pod IP addresses are EPHEMERAL in Kubernetes, across ALL pod
+types (Deployment, StatefulSet, DaemonSet, etc.). A recreated
+`postgres-0` gets a FRESH, DIFFERENT IP than the previous `postgres-0`.
+What IS stable for StatefulSet pods is the DNS NAME
+(`postgres-0.postgres-headless.default.svc.cluster.local`), which
+CoreDNS always resolves to the CURRENT `postgres-0` pod's IP,
+whatever it happens to be. This is why applications in a StatefulSet
+cluster connect to each other via DNS names, never raw IPs.
+
+---
+
+**Q12. What is the difference between deleting a StatefulSet's pod vs deleting the StatefulSet itself?**
+
+Deleting a POD in a StatefulSet: the controller recreates it with
+the same ordinal name, reattaches its existing PVC, data is
+preserved. This is the self-healing behavior.
+
+Deleting the STATEFULSET object itself: the pods are cascade-deleted
+(by default), but the PVCs are NOT automatically deleted — they
+remain, orphaned, with their data intact. This is intentional:
+Kubernetes assumes that for StatefulSet workloads, data is too
+precious to auto-delete. You must explicitly delete the PVCs
+yourself if you want to clean up storage.
+
+```bash
+# Delete StatefulSet -- pods gone, PVCs remain (data safe)
+kubectl delete statefulset postgres
+
+# Manually clean up storage when you're sure
+kubectl delete pvc -l app=postgres
+```
+
+---
+
+## SCENARIO QUESTIONS
+
+---
+
+**Q13. SCENARIO: Your team says "we can just use a Deployment with a PVC for our PostgreSQL database -- we don't need StatefulSet." Under what circumstances are they RIGHT, and when are they WRONG?**
+
+They are RIGHT for a `replicas: 1` (single-instance) setup. With
+only one pod, there is no "multiple pods sharing the same disk"
+problem. The single pod mounts a PVC created separately (not via
+volumeClaimTemplates), and if the pod crashes, Deployment recreates
+it pointing at that same pre-existing PVC — data survives. This
+pattern is genuinely used for development databases, small internal
+tools, or non-critical single instances.
+
+They are WRONG the moment they need `replicas: 2` or more. All
+replicas would reference the SAME PVC — multiple database processes
+writing to the same data files simultaneously. Most storage backends
+reject this at the volume-attachment level for `ReadWriteOnce` PVCs
+(pods get stuck `ContainerCreating`), and even where technically
+allowed, it causes immediate data corruption. StatefulSet's
+`volumeClaimTemplates` solves this by giving each replica its own
+separate PVC. Additionally, Deployment can't provide stable DNS names
+for replicas to discover and connect to each other by ordinal.
+
+---
+
+**Q14. SCENARIO: You have a 3-replica StatefulSet for PostgreSQL. `postgres-0` is the primary. It gets OOMKilled and restarts. During the brief period it's restarting, what happens to read traffic being sent to `postgres-1` and `postgres-2`?**
+
+`postgres-1` and `postgres-2` are unaffected — StatefulSet restarts
+are per-pod and do NOT cause other pods to restart or lose their
+own storage. Read traffic to `postgres-1` and `postgres-2` continues
+normally. However, WRITE traffic directed to `postgres-0` (the
+primary) will fail during the restart window — any write requests
+from the application will get connection refused or timeout errors
+until `postgres-0` comes back up and is Ready.
+
+This is exactly why production database clusters at scale use a tool
+like Patroni — during `postgres-0`'s restart, Patroni detects the
+primary is gone and PROMOTES `postgres-1` to primary, redirecting
+write traffic there. Without Patroni (bare StatefulSet only),
+writes are down until `postgres-0` recovers.
+
+---
+
+**Q15. SCENARIO: Your StatefulSet has `replicas: 3`. You update the pod template to use a new image. The rollout seems to be going very slowly — only one pod has updated after 10 minutes. Is this a problem?**
+
+Not necessarily — this is expected behavior for StatefulSet with
+the default `updateStrategy.rollingUpdate` and
+`podManagementPolicy: OrderedReady`. StatefulSet rolls out updates
+in REVERSE ordinal order (highest first: updates `postgres-2`, waits
+for it to be Ready, then `postgres-1`, waits, then `postgres-0` last)
+AND it is BLOCKING — it will not proceed to the next pod until the
+current one is fully Running AND Ready.
+
+If the new pod takes a long time to become Ready (slow startup,
+readiness probe delay, image pull time), the entire rollout pauses
+at that step.
+
+```bash
+kubectl rollout status sts/<name>
+# Shows which pod is currently being updated and whether it's stuck
+
+kubectl describe pod <new-pod-name>
+# Check Events for ImagePullBackOff, readiness probe failures, etc.
+```
+
+If a pod is genuinely stuck (e.g., new image is broken), the rollout
+will block indefinitely rather than continuing to break more pods —
+this is protective behavior. Roll back with:
+```bash
+kubectl rollout undo sts/<name>
+```
+
+---
+
+**Q16. SCENARIO: You need to add a StatefulSet to your banking project on your resume. What would you say it was used for, and what would you say if the interviewer asks "why StatefulSet and not just a Deployment with a volume?"**
+
+For the resume: "Deployed and managed a 3-replica PostgreSQL
+StatefulSet on AWS EKS for the banking application's transaction
+database, using `volumeClaimTemplates` to provision dedicated EBS
+volumes per replica and a headless Service for stable replica
+addressing. Managed primary/replica role assignment via pod ordinal
+hostname, with automated backup CronJobs writing to S3."
+
+For the interviewer question: "We used StatefulSet rather than
+Deployment because we needed three things a Deployment cannot
+provide: dedicated per-replica storage (via `volumeClaimTemplates`
+giving each pod its own EBS volume — a shared volume would cause
+write conflicts between the primary and replicas), stable network
+identity (so replicas could always find the primary at
+`postgres-0.postgres-headless...` regardless of restarts), and
+ordered startup (to ensure the primary was fully ready before
+replicas tried to connect and begin replication). A Deployment with
+a single PVC would have worked for a single-instance setup, but for
+a 3-replica cluster these three guarantees were non-negotiable."
+
+---
+
+## TROUBLESHOOTING QUESTIONS
+
+---
+
+**Q17. TROUBLESHOOTING: A StatefulSet is stuck at `READY: 1/3`. `web-0` is Running, but `web-1` never starts. What do you check?**
+
+With `OrderedReady` policy, `web-1` will NOT start until `web-0` is
+Running AND Ready. "Running" (the container process started) and
+"Ready" (readiness probe passing) are DIFFERENT states. If `web-0`
+shows `STATUS: Running` but `READY: 0/1`, its readiness probe is
+failing — and the StatefulSet controller is BLOCKING on it,
+preventing `web-1` from ever being created.
+
+```bash
+# Step 1 -- check individual pod readiness
+kubectl get pods -l app=<name>
+# web-0 might show 0/1 Ready even though STATUS is Running
+
+# Step 2 -- check why web-0's readiness probe is failing
+kubectl describe pod web-0
+# Look at Events section for "Readiness probe failed: ..."
+
+# Step 3 -- test the readiness endpoint directly
+kubectl exec web-0 -- curl -v localhost:<port>/ready
+
+# Step 4 -- check pod logs
+kubectl logs web-0
+```
+
+Fix the readiness probe issue on `web-0` (or increase
+`initialDelaySeconds` if the app just needs more warm-up time), and
+once `web-0` becomes Ready, the StatefulSet controller will
+automatically proceed to create `web-1`.
+
+---
+
+**Q18. TROUBLESHOOTING: You delete a StatefulSet pod and it comes back with the same name, but data written before the delete is gone. You confirmed `volumeClaimTemplates` is configured. What's the most likely cause?**
+
+The most common cause: `volumeClaimTemplates` is defined but there
+is NO matching `volumeMounts` entry in the container spec. The PVC
+exists and is `Bound`, but is not actually mounted into the
+container's filesystem — so the container writes to its own ephemeral
+layer, which is discarded on restart.
+
+```bash
+# Confirm the volume IS actually mounted
+kubectl describe pod <pod-name> | grep -A 3 "Mounts:"
+# If you don't see your expected mountPath here, the mount is missing
+
+# Check the StatefulSet spec
+kubectl get sts <name> -o yaml | grep -A 5 "volumeMounts:"
+# If empty or missing, that's the problem
+```
+
+Fix: add the `volumeMounts` section to the container spec:
+```yaml
+containers:
+- name: postgres
+  volumeMounts:
+  - name: data                          # must match volumeClaimTemplates name
+    mountPath: /var/lib/postgresql/data
+```
+
+---
+
+**Q19. TROUBLESHOOTING: `kubectl delete statefulset postgres` succeeded. Now `kubectl get pods` shows no postgres pods — but your storage cost alert fires: you're still being billed for 3 EBS volumes. Why, and how do you fix it?**
+
+StatefulSet deletion cascades to pods (they're deleted) but
+intentionally does NOT cascade to PVCs. Kubernetes assumes that for
+stateful workloads, the data stored in those volumes is too valuable
+to auto-delete — it leaves PVCs orphaned with their data intact,
+waiting for a human to make the explicit decision to delete them.
+
+```bash
+# Confirm PVCs are still there
+kubectl get pvc
+# data-postgres-0   Bound   pvc-abc123  (still exists, billing still running)
+# data-postgres-1   Bound   pvc-def456
+# data-postgres-2   Bound   pvc-ghi789
+
+# If you are CERTAIN you don't need this data
+kubectl delete pvc data-postgres-0 data-postgres-1 data-postgres-2
+# OR delete by label if they have one
+kubectl delete pvc -l app=postgres
+```
+
+In production: always check for orphaned PVCs after deleting a
+StatefulSet. This is a common source of unexpected cloud storage
+bills, especially in environments where StatefulSets are frequently
+recreated (CI/CD environments, development clusters).
+
+---
+
+**Q20. TROUBLESHOOTING: You run `kubectl scale sts postgres --replicas=5`. After a few minutes, you only see 4 pods instead of 5. `kubectl get sts postgres` shows `DESIRED: 5, CURRENT: 4`. What do you investigate?**
+
+With `OrderedReady`, the StatefulSet controller is trying to create
+`postgres-4`, but something is preventing it from becoming Ready,
+so the total count is stuck at 4 (existing) rather than 5 (desired).
+
+```bash
+# Step 1 -- check if the pod was created at all
+kubectl get pods -l app=postgres
+# If postgres-4 exists but is Pending/CrashLoopBackOff, it was
+# created but can't become Ready
+
+# Step 2 -- describe the new pod
+kubectl describe pod postgres-4
+
+# Step 3 -- check if the PVC was created and bound
+kubectl get pvc data-postgres-4
+# If it shows Pending (not Bound), no storage is available --
+# check StorageClass and if your cloud has EBS volume capacity
+
+# Common causes:
+# - PVC stuck Pending (StorageClass misconfigured, cloud quota exceeded)
+# - New pod stuck Pending (node resources insufficient)
+# - New pod CrashLoopBackOff (app error on this new replica)
+# - Readiness probe failing on new pod (blocking controller from
+#   marking it Ready and proceeding)
+```
+
+---
+
+**Q21. TROUBLESHOOTING: You have a 3-replica StatefulSet. A teammate accidentally deleted PVC `data-postgres-1` while `postgres-1` was still running. What happens immediately, and what is the state after `postgres-1` eventually restarts?**
+
+Immediately: the running `postgres-1` pod is UNAFFECTED in the short
+term. The PVC deletion triggers a deletion request, but Kubernetes
+adds a `kubernetes.io/pvc-protection` finalizer to PVCs that are
+actively mounted by a running pod — the PVC will NOT actually be
+deleted until `postgres-1` stops using it. The PVC will show
+`STATUS: Terminating` but the pod continues running normally.
+
+After `postgres-1` restarts (e.g., from a crash, rolling update, or
+node drain): the pod is stopped, the PVC protection finalizer is
+lifted, and the PVC IS actually deleted. When the StatefulSet
+controller creates a new `postgres-1` pod, it looks for PVC
+`data-postgres-1` — not found. It creates a BRAND NEW `data-postgres-1`
+PVC from the `volumeClaimTemplates` spec — this is an EMPTY, fresh
+volume. All data that was on the old `data-postgres-1` PVC is
+permanently gone.
+
+The fix after this incident: immediately stop any rollout/restart
+of `postgres-1` to prevent the PVC from being released, take a
+database dump/backup from a running replica, and if the PVC IS
+already deleted and gone, restore from the most recent backup.
+
+Prevention: use RBAC to ensure only the platform team can delete
+PVCs in production namespaces. Add monitoring alerts for any PVC
+entering `Terminating` state in production.
+
+---
+
+*Run all 5 labs before interviews — especially Lab 3 (data
+persistence test) and Lab 5 (hostname-based role assignment). These
+two labs produce outputs you can directly reference in answers to
+Q5, Q6, and Q7.*
