@@ -515,7 +515,6 @@ Real DaemonSet use cases in industry:
 ## PART 2 — HANDS-ON LABS
 
 ---
-
 ## Lab 1 — Create a Simple DaemonSet and Watch One-Per-Node
 
 ```bash
@@ -566,9 +565,11 @@ kubectl get pods -l app=simple-daemon -o wide
 kubectl get daemonset simple-daemon
 # DESIRED = number of nodes in your cluster
 
-# See what the pod logs -- it knows its own node name
-kubectl logs $(kubectl get pods -l app=simple-daemon \
-  -o jsonpath='{.items[0].metadata.name}')
+# Step 1 -- get the pod name from the output above
+# e.g. simple-daemon-x7k2p
+
+# Step 2 -- use that name to check logs
+kubectl logs simple-daemon-x7k2p
 # "I am running on node: node01"
 
 kubectl delete daemonset simple-daemon
@@ -601,25 +602,25 @@ spec:
         image: nginx:1.25
 EOF
 
+# Step 1 -- get the pod name
 kubectl get pods -l app=scheduler-proof
+# e.g. scheduler-proof-cddz4
 
 # CHECK 1 -- nodeAffinity is pre-set by DaemonSet controller
 # (you never wrote this in your YAML)
-kubectl get pod $(kubectl get pods -l app=scheduler-proof \
-  -o jsonpath='{.items[0].metadata.name}') -o yaml | grep -A 15 affinity
+kubectl describe pod scheduler-proof-cddz4 | grep -A 20 "Affinity"
 # You will see a nodeAffinity locking this pod to a specific node
 # A regular pod you create has NO affinity unless you explicitly add it
 
 # CHECK 2 -- extra tolerations DaemonSet adds automatically
-kubectl get pod $(kubectl get pods -l app=scheduler-proof \
-  -o jsonpath='{.items[0].metadata.name}') -o yaml | grep -A 30 tolerations
+kubectl describe pod scheduler-proof-cddz4 | grep -A 30 "Tolerations"
 # You will see MANY tolerations including:
 # disk-pressure, memory-pressure, unschedulable, pid-pressure
 # These are added AUTOMATICALLY -- you never wrote them
 
 # CHECK 3 -- compare with a regular pod's tolerations
 kubectl run test-pod --image=nginx:1.25
-kubectl get pod test-pod -o yaml | grep -A 15 tolerations
+kubectl describe pod test-pod | grep -A 10 "Tolerations"
 # Only 2 tolerations (not-ready and unreachable)
 # DaemonSet pod has many more -- this is the KEY difference
 
@@ -636,10 +637,10 @@ kubectl delete pod test-pod
 The DaemonSet controller does NOT completely bypass the Scheduler in
 modern Kubernetes. Instead it pre-bakes a nodeAffinity to force
 placement on a specific node AND automatically adds many more
-tolerations than a regular pod gets. The Scheduler technically
-runs but has no real choice. The tolerations are the other key
-difference -- DaemonSet pods survive on unhealthy nodes where
-regular pods would be evicted.
+tolerations than a regular pod gets. The Scheduler technically runs
+but has no real choice. The tolerations are the other key difference
+-- DaemonSet pods survive on unhealthy nodes where regular pods
+would be evicted.
 
 ---
 
@@ -662,20 +663,17 @@ kubectl describe daemonset cilium -n kube-system
 # Volumes: hostPath mounts for host-level access
 
 # See one cilium pod per node
-kubectl get pods -n kube-system -l k8s-app=cilium -o wide
+kubectl get pods -n kube-system -o wide | grep cilium
 # One pod on controlplane, one pod on node01
 
-# Check the nodeAffinity pre-set on a cilium pod
-kubectl get pod \
-  $(kubectl get pods -n kube-system -l k8s-app=cilium \
-  -o jsonpath='{.items[0].metadata.name}') \
-  -n kube-system -o yaml | grep -A 15 affinity
+# Step 1 -- get a cilium pod name from the output above
+# e.g. cilium-ptmj9
 
-# Check all the tolerations on a cilium pod
-kubectl get pod \
-  $(kubectl get pods -n kube-system -l k8s-app=cilium \
-  -o jsonpath='{.items[0].metadata.name}') \
-  -n kube-system -o yaml | grep -A 30 tolerations
+# Step 2 -- check the nodeAffinity pre-set on that pod
+kubectl describe pod cilium-ptmj9 -n kube-system | grep -A 20 "Affinity"
+
+# Step 3 -- check all the tolerations on that pod
+kubectl describe pod cilium-ptmj9 -n kube-system | grep -A 30 "Tolerations"
 ```
 
 ### On MicroK8s
@@ -688,8 +686,17 @@ kubectl get daemonsets -n kube-system
 # Describe it
 kubectl describe daemonset calico-node -n kube-system
 
-# See pods
-kubectl get pods -n kube-system -l k8s-app=calico-node -o wide
+# See pods -- one per node
+kubectl get pods -n kube-system -o wide | grep calico
+
+# Step 1 -- get a calico-node pod name from output above
+# e.g. calico-node-fbrxf
+
+# Step 2 -- check affinity
+kubectl describe pod calico-node-fbrxf -n kube-system | grep -A 20 "Affinity"
+
+# Step 3 -- check tolerations
+kubectl describe pod calico-node-fbrxf -n kube-system | grep -A 30 "Tolerations"
 ```
 
 ---
@@ -722,10 +729,13 @@ EOF
 
 kubectl get pods -l app=update-demo -o wide
 
-# Verify initial image
-kubectl get pods -l app=update-demo \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.containers[0].image}{"\n"}{end}'
-# All show nginx:1.24
+# Step 1 -- get pod names and check initial image
+kubectl get pods -l app=update-demo
+# e.g. update-demo-abc12, update-demo-def34
+
+# Step 2 -- describe one pod to confirm image is nginx:1.24
+kubectl describe pod update-demo-abc12 | grep Image
+# Image: nginx:1.24
 
 # Update the image
 kubectl set image daemonset/update-demo nginx=nginx:1.25
@@ -737,10 +747,12 @@ kubectl rollout status daemonset/update-demo
 # 2 out of 2 new pods have been updated...
 # daemon set "update-demo" successfully rolled out
 
-# Verify all pods are now on new image
-kubectl get pods -l app=update-demo \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.containers[0].image}{"\n"}{end}'
-# All show nginx:1.25
+# Step 3 -- get new pod names (they were recreated)
+kubectl get pods -l app=update-demo
+
+# Step 4 -- describe a new pod to confirm image updated to nginx:1.25
+kubectl describe pod update-demo-xyz99 | grep Image
+# Image: nginx:1.25
 
 # Rollback if needed
 kubectl rollout undo daemonset/update-demo
@@ -808,6 +820,34 @@ kubectl label node controlplane role-
 ```
 
 ---
+
+## Quick Reference — DaemonSet Commands
+
+```bash
+# Get
+kubectl get daemonsets
+kubectl get ds                          # short form
+kubectl get ds -n kube-system
+
+# Inspect
+kubectl describe ds <name>
+kubectl describe ds <name> -n kube-system
+
+# Update image
+kubectl set image ds/<name> <container>=<new-image>
+
+# Rollout management (same as Deployment)
+kubectl rollout status ds/<name>
+kubectl rollout history ds/<name>
+kubectl rollout undo ds/<name>
+
+# Scale (rarely used -- count is automatic)
+# DaemonSet does not have a replicas field
+# To reduce where it runs, use nodeSelector or node labels
+
+# Delete
+kubectl delete ds <name>
+```
 
 ## Quick Reference — DaemonSet Commands
 
