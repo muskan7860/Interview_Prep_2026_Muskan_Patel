@@ -821,32 +821,7 @@ kubectl label node controlplane role-
 
 ---
 
-## Quick Reference — DaemonSet Commands
 
-```bash
-# Get
-kubectl get daemonsets
-kubectl get ds                          # short form
-kubectl get ds -n kube-system
-
-# Inspect
-kubectl describe ds <name>
-kubectl describe ds <name> -n kube-system
-
-# Update image
-kubectl set image ds/<name> <container>=<new-image>
-
-# Rollout management (same as Deployment)
-kubectl rollout status ds/<name>
-kubectl rollout history ds/<name>
-kubectl rollout undo ds/<name>
-
-# Scale (rarely used -- count is automatic)
-# DaemonSet does not have a replicas field
-# To reduce where it runs, use nodeSelector or node labels
-
-# Delete
-kubectl delete ds <name>
 ```
 
 ## Quick Reference — DaemonSet Commands
