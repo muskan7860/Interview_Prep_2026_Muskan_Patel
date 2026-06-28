@@ -1,7 +1,5 @@
 # Kubernetes API Server Request Flow — Admission Controllers, Mutating & Validating Webhooks
 ## Deep Dive Concept + Hands-On Lab
-> Written for: Someone with 4 years of DevOps experience preparing for senior-level interviews
-> Style: First-standard student explanation → deep technical truth → hands-on lab with line-by-line explanation
 
 ---
 
