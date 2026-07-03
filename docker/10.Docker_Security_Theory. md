@@ -1,0 +1,1369 @@
+# Docker Security — Theory + Practical Labs
+
+> **Who is this for?**
+> Someone completely new to Docker security.
+> Every concept built from zero. Every word, path, and command explained.
+> No assumptions. No skipped steps.
+
+---
+
+## 📌 Table of Contents
+
+1. [Why Docker Security Matters](#1-why-docker-security-matters)
+2. [Security Topic 1 — Non-Root USER](#2-security-topic-1--non-root-user)
+3. [Security Topic 2 — Read-Only Filesystem](#3-security-topic-2--read-only-filesystem)
+4. [Security Topic 3 — No Privileged Mode](#4-security-topic-3--no-privileged-mode)
+5. [Security Topic 4 — Linux Capabilities](#5-security-topic-4--linux-capabilities)
+6. [Security Topic 5 — .dockerignore](#6-security-topic-5--dockerignore)
+7. [Security Topic 6 — Image Scanning (Trivy and Snyk)](#7-security-topic-6--image-scanning-trivy-and-snyk)
+8. [Security Topic 7 — Secrets Management](#8-security-topic-7--secrets-management)
+9. [Security Topic 8 — AppArmor and Seccomp](#9-security-topic-8--apparmor-and-seccomp)
+10. [Security Topic 9 — Resource Limits](#10-security-topic-9--resource-limits)
+11. [Defence in Depth — All Layers Together](#11-defence-in-depth--all-layers-together)
+12. [Practical Labs](#12-practical-labs)
+13. [Quick Revision Cheatsheet](#13-quick-revision-cheatsheet)
+14. [Further Reading](#14-further-reading)
+
+---
+
+## 1. Why Docker Security Matters
+
+### The Shared Kernel Problem
+
+We learned this in Core Concepts. Containers share the host machine's Linux kernel.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Host Machine                       │
+│                                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  │
+│  │ Container 1 │  │ Container 2 │  │ Container 3│  │
+│  │  (your app) │  │ (your db)   │  │ (attacker?)│  │
+│  └─────────────┘  └─────────────┘  └────────────┘  │
+│                                                     │
+│  ══════════════ SHARED HOST KERNEL ═══════════════  │
+└─────────────────────────────────────────────────────┘
+```
+
+This means: a vulnerability inside one container could potentially affect the host machine or other containers on the same host.
+
+**This is fundamentally different from VMs**, where each VM has its own kernel. A compromised VM cannot affect the host kernel.
+
+### The Attack Surface of a Container
+
+When someone attacks a containerised application, they try to:
+
+1. **Exploit the application** — find a bug in your code
+2. **Move sideways** — from the container, reach other containers or services
+3. **Break out** — escape the container to the host machine (container breakout)
+4. **Escalate privileges** — go from a limited user to root
+
+Docker security is about making each of these steps as hard as possible.
+
+### The Defence in Depth Principle
+
+No single security measure is perfect.
+Real security comes from MULTIPLE layers of protection.
+
+```
+Layer 1: Run as non-root user         → If exploited, limited damage
+Layer 2: Read-only filesystem          → Cannot write malicious files
+Layer 3: No privileged mode            → Cannot access host devices
+Layer 4: Minimal capabilities          → Cannot do dangerous syscalls
+Layer 5: Resource limits               → Cannot exhaust host resources
+Layer 6: Image scanning                → No known vulnerabilities in image
+Layer 7: Secrets management            → No credentials in the image
+Layer 8: Network isolation             → Cannot reach what it should not
+Layer 9: AppArmor / Seccomp            → Kernel-level syscall filtering
+```
+
+Even if one layer fails, the others still protect you.
+
+---
+
+## 2. Security Topic 1 — Non-Root USER
+
+### The Problem
+
+By default, containers run as the **root user** (UID 0).
+
+This is a serious security risk.
+
+**Simple story:**
+
+Imagine you hire a contractor to fix your bathroom tiles.
+Would you give them the master key to your entire house — including the safe, the server room, and every other room?
+
+No. You give them access to the bathroom only.
+
+Running a container as root is giving the contractor the master key.
+If they do something wrong (accidentally or maliciously), they can affect your ENTIRE house.
+
+**What root inside a container can do:**
+
+- Read any file inside the container (including config files with passwords)
+- Write to any location inside the container
+- Install additional software (attackers love this)
+- If combined with other vulnerabilities — potentially escape to the host
+- With volume mounts — read or write HOST files as root
+
+### The Solution — USER Instruction
+
+Create a dedicated non-root user in your Dockerfile and switch to it before CMD/ENTRYPOINT.
+
+```dockerfile
+FROM node:20-alpine
+
+# Step 1: Create a group with a specific GID (Group ID)
+RUN addgroup -S appgroup -g 1001
+
+# Step 2: Create a user in that group with a specific UID (User ID)
+RUN adduser -S appuser -u 1001 -G appgroup
+
+# Step 3: Set up the application directory
+WORKDIR /app
+
+# Step 4: Copy files WITH the right ownership
+# This sets both user and group for copied files
+COPY --chown=appuser:appgroup package*.json ./
+
+RUN npm ci --only=production
+
+COPY --chown=appuser:appgroup . .
+
+# Step 5: Switch to non-root user BEFORE CMD
+# All subsequent instructions run as appuser, not root
+USER appuser
+
+# EXPOSE is documentation only
+EXPOSE 3000
+
+# CMD runs as appuser now
+CMD ["node", "server.js"]
+```
+
+**Breaking down the user creation:**
+
+`addgroup` = command to add a group on Alpine Linux
+`-S` = system group (no login, used for services)
+`appgroup` = name of the group
+`-g 1001` = set group ID to 1001
+
+`adduser` = command to add a user on Alpine Linux
+`-S` = system user (no login, no home directory by default)
+`appuser` = name of the user
+`-u 1001` = set user ID to 1001
+`-G appgroup` = add to the appgroup group
+
+**Why specify specific UIDs/GIDs (1001)?**
+
+UIDs and GIDs 0-999 are reserved for system use on Linux.
+Starting from 1000+ is the convention for non-system users.
+Specifying a specific number ensures consistency across different environments.
+If you ever need to match file ownership between host and container, you need predictable UIDs.
+
+**On Ubuntu/Debian base images, use `useradd` instead:**
+
+```dockerfile
+FROM ubuntu:22.04
+
+# Ubuntu uses useradd/groupadd instead of adduser/addgroup
+RUN groupadd -r -g 1001 appgroup && \
+    useradd -r -u 1001 -g appgroup appuser
+```
+
+`groupadd` = add a group
+`-r` = system group/user (no login)
+`-g 1001` = group ID
+
+`useradd` = add a user
+`-r` = system user
+`-u 1001` = user ID
+`-g appgroup` = primary group
+
+### File Permissions When Switching Users
+
+A common problem when switching to non-root:
+
+```dockerfile
+FROM nginx:alpine
+
+# This FAILS when nginx starts — port 80 requires root
+# And nginx config files are owned by root
+USER appuser
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**The fix — set ownership before switching:**
+
+```dockerfile
+FROM nginx:alpine
+
+# Create non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Change ownership of nginx files to appuser BEFORE switching
+RUN chown -R appuser:appgroup \
+    /var/cache/nginx \
+    /var/log/nginx \
+    /etc/nginx/conf.d
+
+# Use port 8080 instead of 80 (non-root cannot bind to ports < 1024)
+# Update nginx config to listen on 8080
+
+USER appuser
+
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+`chown` = change ownership
+`-R` = recursive (change all files and subdirectories)
+`appuser:appgroup` = new owner (user:group)
+
+### The Port < 1024 Problem
+
+On Linux, binding to ports below 1024 requires root privileges.
+This is why web servers traditionally ran on port 80 (requires root) or 8080 (does not require root).
+
+```
+Port 80, 443 → requires root (or CAP_NET_BIND_SERVICE capability)
+Port 1024+ → any user can bind
+```
+
+**Solution for production:** run your app on port 8080 inside the container, publish to port 80 on the host with `-p 80:8080`. The mapping happens in the host's network stack, not inside the container.
+
+```bash
+docker run -p 80:8080 myapp
+# External traffic hits host port 80
+# Docker NAT redirects to container port 8080
+# App inside runs as non-root on port 8080
+```
+
+---
+
+## 3. Security Topic 2 — Read-Only Filesystem
+
+### What is a Read-Only Filesystem?
+
+Normally, a running container can write files anywhere in its filesystem.
+This means an attacker who exploits your app can:
+- Write malicious scripts
+- Modify application code
+- Add backdoor programs
+- Modify configuration files
+
+A read-only filesystem prevents ALL writes to the container's filesystem.
+
+```bash
+# Make the container filesystem read-only
+docker run --read-only nginx
+```
+
+`--read-only` = mount the container's root filesystem as read-only. The container can still read everything but cannot write anywhere.
+
+### The Problem — Apps Need to Write SOMEWHERE
+
+Almost every application needs to write somewhere:
+- Log files
+- Temporary files in `/tmp`
+- PID files
+- Cache files
+
+With `--read-only`, these writes fail.
+
+**The solution — combine with tmpfs for writable temp space:**
+
+```bash
+docker run \
+  --read-only \
+  --tmpfs /tmp \
+  --tmpfs /run \
+  --tmpfs /var/cache/nginx \
+  nginx
+```
+
+`--tmpfs /tmp` = create a RAM-based tmpfs mount at `/tmp`.
+The container can read and write to `/tmp`, but it is in RAM only.
+When the container stops, the tmpfs is cleared automatically.
+
+### In Docker Compose
+
+```yaml
+services:
+  webapp:
+    image: myapp:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+      - /var/cache
+```
+
+`read_only: true` = equivalent to `--read-only`
+`tmpfs:` = list of paths to create as tmpfs mounts
+
+### In a Dockerfile — VOLUME for Needed Writes
+
+For data that must persist (logs, uploads), use volumes with the filesystem read-only:
+
+```bash
+docker run \
+  --read-only \
+  --tmpfs /tmp \
+  -v app-logs:/app/logs \    # named volume for logs — writable
+  myapp:latest
+```
+
+The root filesystem is read-only. Only the mounted volume path (`/app/logs`) is writable.
+
+---
+
+## 4. Security Topic 3 — No Privileged Mode
+
+### What is Privileged Mode?
+
+`--privileged` is a flag you can pass to `docker run`.
+
+When a container runs in privileged mode, it gets **nearly all the power of the host machine's root user**.
+
+Specifically, privileged mode:
+- Disables all security isolation (AppArmor, Seccomp, capabilities all turned off)
+- Gives access to ALL host devices (`/dev/`)
+- Allows mounting filesystems
+- Allows loading kernel modules
+- Essentially makes the container as powerful as the host root user
+
+```bash
+# NEVER do this in production
+docker run --privileged myapp
+```
+
+### Why Privileged Mode is Dangerous
+
+A privileged container can easily break out to the host:
+
+```bash
+# Inside a privileged container, this can mount the host filesystem
+mkdir /host
+mount /dev/sda1 /host
+# Now you can read and write the HOST's entire disk
+# This is a complete container escape
+```
+
+This is not a vulnerability — this is intentional behaviour.
+`--privileged` was designed for special cases like running Docker inside Docker.
+But it is catastrophically misused.
+
+### When is Privileged Mode Legitimately Used?
+
+Very few scenarios:
+- Docker-in-Docker (running Docker inside a container — mainly in CI systems)
+- Low-level hardware testing
+- Some network diagnostic tools
+
+For almost everything else, you can use specific capabilities instead of full privileged mode.
+
+### The Safer Alternative — Specific Capabilities
+
+Instead of `--privileged` (gives everything), add only the specific capability you need:
+
+```bash
+# Instead of --privileged to allow network configuration:
+docker run --cap-add NET_ADMIN myapp
+
+# Instead of --privileged for binding port 80 as non-root:
+docker run --cap-add NET_BIND_SERVICE myapp
+```
+
+This is explained in detail in the next section.
+
+---
+
+## 5. Security Topic 4 — Linux Capabilities
+
+### What are Linux Capabilities?
+
+Traditionally, Linux had a binary security model:
+- Root (UID 0) = can do EVERYTHING
+- Non-root = very limited
+
+This is too coarse. Root needs all its power only rarely.
+
+Linux Capabilities broke the "root can do everything" into ~40 specific permissions:
+
+| Capability | What It Allows |
+|------------|---------------|
+| `CAP_NET_ADMIN` | Configure network interfaces, firewalls |
+| `CAP_NET_BIND_SERVICE` | Bind to ports below 1024 |
+| `CAP_SYS_ADMIN` | A huge catch-all — many dangerous operations |
+| `CAP_CHOWN` | Change file ownership |
+| `CAP_SETUID` | Change user ID (switch between users) |
+| `CAP_SYS_PTRACE` | Debug processes (spy on them) |
+| `CAP_SYS_MODULE` | Load/unload kernel modules |
+| `CAP_NET_RAW` | Create raw network packets (for tools like ping) |
+| `CAP_AUDIT_WRITE` | Write to kernel audit log |
+
+### What Docker Does By Default
+
+Docker gives containers a LIMITED set of capabilities by default.
+These are enough for most applications but remove the most dangerous ones.
+
+**Default capabilities Docker gives:**
+
+```
+CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FSETID, CAP_FOWNER,
+CAP_MKNOD, CAP_NET_RAW, CAP_SETGID, CAP_SETUID,
+CAP_SETFCAP, CAP_SETPCAP, CAP_NET_BIND_SERVICE,
+CAP_SYS_CHROOT, CAP_KILL, CAP_AUDIT_WRITE
+```
+
+**Dangerous capabilities NOT given by default:**
+
+```
+CAP_SYS_ADMIN (dangerous — blocks most privilege escalation)
+CAP_SYS_MODULE (cannot load kernel modules)
+CAP_SYS_PTRACE (cannot spy on processes)
+CAP_NET_ADMIN (cannot reconfigure host network)
+```
+
+### Best Practice — Drop ALL Then Add Back Only What You Need
+
+```bash
+# Drop ALL capabilities first
+docker run --cap-drop ALL myapp
+
+# Then add back only what your specific app needs
+docker run \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \   # only if app needs to bind to port < 1024
+  myapp
+```
+
+This is called the **principle of least privilege** — grant only the minimum permissions needed.
+
+**In Docker Compose:**
+
+```yaml
+services:
+  webapp:
+    image: myapp:latest
+    cap_drop:
+      - ALL              # drop everything first
+    cap_add:
+      - NET_BIND_SERVICE  # add back only what is needed
+```
+
+### The Most Dangerous Capability — CAP_SYS_ADMIN
+
+`CAP_SYS_ADMIN` is a massive capability that grants:
+- Mounting filesystems
+- Creating namespaces
+- Modifying kernel parameters
+- Many other operations
+
+Never grant this capability unless absolutely necessary.
+Some tutorials suggest it to solve problems — there is almost always a better, more targeted fix.
+
+---
+
+## 6. Security Topic 5 — .dockerignore
+
+### What is .dockerignore?
+
+We touched on `.dockerignore` in the Dockerfile topic for performance.
+But it is ALSO a critical security tool.
+
+When you run `docker build .`, Docker sends the entire current directory to the Docker daemon as the **build context**. Every file you `COPY . .` copies everything in that context into the image.
+
+**Without `.dockerignore`, your image might accidentally contain:**
+
+```
+.env                    ← database passwords, API keys, secrets!
+.env.production         ← production credentials!
+.git/                   ← your entire git history!
+*.pem                   ← SSL private keys!
+id_rsa                  ← SSH private keys!
+*.key                   ← other private keys!
+secrets/                ← any secrets folder!
+```
+
+If any of these end up in your Docker image and you push it to a registry — even a private one — you have potentially exposed all your secrets to anyone with access to that registry.
+
+### The Solution — .dockerignore File
+
+Create a `.dockerignore` file in the same directory as your Dockerfile.
+This file lists what should NOT be sent to the Docker daemon or copied into the image.
+
+```dockerignore
+# Version control — never needed in image
+.git
+.gitignore
+.gitattributes
+
+# Secret files — MOST IMPORTANT
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+secrets/
+credentials/
+*.credential
+
+# Local development configs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Node.js — do not include — rebuild inside container
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Test files — not needed in production image
+tests/
+test/
+*.test.js
+*.spec.js
+coverage/
+
+# Documentation
+docs/
+*.md
+README*
+CHANGELOG*
+
+# Build artifacts — built inside container
+dist/
+build/
+target/
+*.jar
+*.war
+
+# Docker files themselves — not needed inside image
+Dockerfile*
+docker-compose*
+.dockerignore
+```
+
+### Why This Matters — A Real Incident Pattern
+
+This is a very common way companies accidentally expose credentials:
+
+```
+Step 1: Developer copies .env to project root for quick testing
+Step 2: Developer runs docker build .
+Step 3: COPY . . puts .env into the image
+Step 4: Developer pushes image to Docker Hub (even in a private repo)
+Step 5: Anyone with pull access can now:
+         docker pull companyname/webapp:latest
+         docker run --rm --entrypoint cat companyname/webapp:latest /app/.env
+         # Sees: DATABASE_URL=postgresql://admin:PRODUCTION_PASSWORD@...
+```
+
+Always verify your `.dockerignore` is working:
+
+```bash
+# Build the image and inspect what went in
+docker build -t test-image .
+docker run --rm test-image find /app -name "*.env" -o -name "*.pem" -o -name "*.key"
+# This should return NOTHING
+```
+
+---
+
+## 7. Security Topic 6 — Image Scanning (Trivy and Snyk)
+
+We covered this in the Registry topic. Here is the security-focused summary.
+
+### What Image Scanning Catches
+
+Image scanning checks your image against the CVE (Common Vulnerabilities and Exposures) database.
+
+Vulnerabilities can be in:
+- **OS packages** — the packages installed in your base image (`apt-get install curl` etc.)
+- **Language runtime** — the version of Node.js, Python, Java inside the image
+- **Application libraries** — packages in `package.json`, `requirements.txt`, `pom.xml`
+
+### Trivy — The Essential Commands for Security
+
+```bash
+# Basic scan
+trivy image myapp:1.0
+
+# Only show high and critical — filter out noise
+trivy image --severity HIGH,CRITICAL myapp:1.0
+
+# In CI — fail the pipeline if any CRITICAL found
+trivy image --exit-code 1 --severity CRITICAL myapp:1.0
+
+# Only show vulnerabilities that have a fix available
+# (no point reporting vulnerabilities you cannot fix yet)
+trivy image --ignore-unfixed myapp:1.0
+
+# Generate a report in JSON (for automated processing)
+trivy image --format json --output report.json myapp:1.0
+
+# Scan a local Dockerfile (before building)
+trivy config Dockerfile
+
+# Scan a docker-compose.yml file
+trivy config docker-compose.yml
+```
+
+### When to Scan
+
+**The security pipeline:**
+
+```
+1. Developer writes code
+2. Developer builds image: docker build -t myapp:abc1234 .
+3. CI runs Trivy: trivy image --exit-code 1 --severity CRITICAL myapp:abc1234
+4. If CRITICAL found → pipeline fails → developer must fix before merging
+5. If scan passes → push to registry → deploy
+6. Schedule weekly: re-scan ALL running images (new CVEs discovered daily)
+```
+
+### Base Image Strategy for Security
+
+```dockerfile
+# BEST for security — alpine has almost no packages to have CVEs
+FROM node:20-alpine
+
+# GOOD — slim removes most unnecessary packages
+FROM node:20-slim
+
+# AVOID for production — full Debian has hundreds of packages = large attack surface
+FROM node:20
+```
+
+**The rule:** Smaller base image = fewer packages = fewer potential CVEs = smaller attack surface.
+
+---
+
+## 8. Security Topic 7 — Secrets Management
+
+### Never Bake Secrets Into Images
+
+This is one of the most critical security rules.
+
+```dockerfile
+# ❌ NEVER DO THIS — password visible in docker history
+ENV DATABASE_PASSWORD=mysecretpassword
+
+# ❌ NEVER DO THIS — even if you later remove the file, it is in a layer
+COPY .env /app/.env
+RUN source /app/.env && do-something
+RUN rm /app/.env  # TOO LATE — the file is in the previous layer!
+```
+
+**Why `RUN rm .env` after COPY does not help:**
+
+OverlayFS layers are immutable. When you delete a file in a later layer, Docker creates a "whiteout" file that hides the original. But the original is still in the earlier layer. Anyone who runs `docker history` or directly reads the layer filesystem can see the deleted file.
+
+### Correct Ways to Handle Secrets
+
+**Method 1 — Inject at Runtime (Most Common):**
+
+```bash
+# Never bake secrets into the image
+# Pass them at container start time
+docker run \
+  -e DATABASE_URL="postgresql://user:password@host:5432/db" \
+  -e API_KEY="secret-api-key" \
+  myapp:1.0
+```
+
+The image contains NO secrets. Secrets live only in the running process environment.
+
+**Method 2 — Docker Secrets (Swarm Mode):**
+
+```bash
+# Create a Docker secret
+echo "mysecretpassword" | docker secret create db_password -
+
+# Reference it in docker-compose.yml (Swarm mode)
+```
+
+```yaml
+services:
+  webapp:
+    image: myapp:latest
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    external: true  # was created with docker secret create
+```
+
+Inside the container, the secret is available as a file at:
+```
+/run/secrets/db_password
+```
+
+Your application reads the file instead of an environment variable. Files are more secure than env vars — less likely to be logged accidentally.
+
+**Method 3 — BuildKit Secret Mounts (For Build-Time Secrets):**
+
+Sometimes you need a secret during build — like an npm token to install private packages, or a pip token for a private PyPI server.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# ❌ WRONG — token visible in docker history
+RUN NPM_TOKEN=secret npm install
+
+# ✅ CORRECT — secret is available ONLY during this RUN, never in any layer
+RUN --mount=type=secret,id=npm_token \
+    NPM_TOKEN=$(cat /run/secrets/npm_token) npm install
+```
+
+Build with:
+```bash
+docker build \
+  --secret id=npm_token,src=$HOME/.npmrc \
+  -t myapp:1.0 \
+  .
+```
+
+`--secret id=npm_token,src=$HOME/.npmrc` = make `$HOME/.npmrc` available as a secret with ID `npm_token` during the build. It is NEVER written to any layer.
+
+**Method 4 — External Secret Managers (Production):**
+
+```
+AWS Secrets Manager → your app calls AWS API at startup → gets the secret → uses it
+HashiCorp Vault     → your app calls Vault API at startup → gets the secret → uses it
+Azure Key Vault     → same pattern for Azure
+```
+
+With this approach, NO secrets exist in the container image, in environment files, or on the server's disk. They are fetched fresh from a secure secret store every time the container starts.
+
+---
+
+## 9. Security Topic 8 — AppArmor and Seccomp
+
+We covered these briefly in `docker info`. Here is the deeper picture.
+
+### AppArmor — File and Network Access Control
+
+AppArmor is a Linux security module that enforces a per-process security policy.
+
+Docker's default AppArmor profile (`docker-default`) automatically applies to every container.
+It restricts:
+- Access to sensitive kernel paths like `/proc/sys/`
+- Ability to mount filesystems
+- Ability to load kernel modules
+
+```bash
+# See which AppArmor profile is active on a container
+docker inspect mycontainer | jq '.[0].HostConfig.SecurityOpt'
+# Output: ["apparmor=docker-default"]
+
+# Run with no AppArmor profile (less secure — avoid in prod)
+docker run --security-opt apparmor=unconfined nginx
+
+# Run with a custom AppArmor profile
+docker run --security-opt apparmor=my-custom-profile nginx
+```
+
+### Seccomp — System Call Filtering
+
+Seccomp (Secure Computing Mode) filters which Linux system calls a process can make.
+
+Docker's default seccomp profile blocks **44 dangerous syscalls** including:
+- `reboot` — cannot restart the host
+- `kexec_load` — cannot load a new kernel
+- `create_module` — cannot load kernel modules
+- `mount` — cannot mount filesystems
+- `ptrace` — cannot spy on other processes
+
+```bash
+# See the default seccomp profile
+# (stored inside the Docker binary, not as a file on your system)
+# Download and view it:
+curl -s https://raw.githubusercontent.com/moby/moby/master/profiles/seccomp/default.json | \
+  jq '.syscalls | length'
+# Shows: number of syscall rules defined
+
+# Run with no seccomp filtering (less secure — avoid)
+docker run --security-opt seccomp=unconfined nginx
+
+# Run with custom seccomp profile
+docker run --security-opt seccomp=my-profile.json nginx
+
+# See what Docker applies to a running container
+docker inspect mycontainer | jq '.[0].HostConfig.SecurityOpt'
+```
+
+---
+
+## 10. Security Topic 9 — Resource Limits
+
+### Why Resource Limits Are a Security Topic
+
+Resource limits prevent **Denial of Service (DoS)** attacks from within containers.
+
+If a container can consume unlimited CPU, memory, or processes, a compromised or buggy container can:
+- Starve other containers of resources (noisy neighbour attack)
+- Fork bomb the host (create unlimited processes, crash the machine)
+- OOM-kill other important services on the node
+
+```bash
+docker run \
+  --memory=512m \           # max 512MB RAM — OOM kill if exceeded
+  --memory-reservation=256m \ # soft limit — try to stay under 256MB
+  --cpus=1.0 \              # max 1 CPU core worth of time
+  --pids-limit=100 \        # max 100 processes — prevents fork bombs
+  myapp:latest
+```
+
+In Docker Compose:
+
+```yaml
+services:
+  webapp:
+    image: myapp:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+```
+
+**The `--pids-limit` against fork bombs:**
+
+A fork bomb is a process that keeps creating child processes infinitely, crashing the system:
+```bash
+# This is a fork bomb — creates infinite processes
+:(){ :|:& };:
+# Do NOT run this
+```
+
+`--pids-limit=100` prevents any one container from ever having more than 100 processes.
+If it tries to create process number 101, the kernel refuses.
+
+---
+
+## 11. Defence in Depth — All Layers Together
+
+Here is a complete secure container configuration using all the principles:
+
+**Dockerfile:**
+```dockerfile
+FROM node:20-alpine
+
+# Layer 1: Run as non-root
+RUN addgroup -S -g 1001 appgroup && \
+    adduser -S -u 1001 -G appgroup appuser
+
+# Layer 6: No secrets in the image
+# (secrets passed at runtime via environment or volume)
+
+WORKDIR /app
+
+COPY --chown=appuser:appgroup package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+COPY --chown=appuser:appgroup . .
+
+USER appuser
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
+CMD ["node", "server.js"]
+```
+
+**docker run with all security flags:**
+```bash
+docker run -d \
+  --name secure-app \
+  --user 1001:1001 \            # enforce non-root even if image default is root
+  --read-only \                 # read-only root filesystem
+  --tmpfs /tmp \                # writable temp space in RAM
+  --cap-drop ALL \              # drop all capabilities
+  --cap-add NET_BIND_SERVICE \  # add back only what is needed
+  --no-new-privileges \         # prevent privilege escalation via setuid binaries
+  --security-opt apparmor=docker-default \  # AppArmor profile
+  --security-opt seccomp=./seccomp-profile.json \  # custom seccomp
+  --memory=256m \               # memory limit
+  --cpus=0.5 \                 # CPU limit
+  --pids-limit=50 \            # process limit
+  -e DATABASE_URL="${DATABASE_URL}" \  # inject secret from shell env
+  -p 8080:3000 \
+  myapp:1.0
+```
+
+`--no-new-privileges` = prevents the process from gaining new privileges through setuid binaries or seccomp restrictions being bypassed. Even if an attacker runs a setuid binary inside the container, it cannot gain root.
+
+**In Docker Compose:**
+```yaml
+services:
+  webapp:
+    image: myapp:1.0
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+      - apparmor:docker-default
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    pids_limit: 50
+```
+
+---
+
+## 12. Practical Labs
+
+### Lab 1 — Run as Non-Root and Verify
+
+```bash
+mkdir -p /home/$USER/docker-labs/security-lab
+cd /home/$USER/docker-labs/security-lab
+
+# Create a Dockerfile that uses non-root user
+cat > Dockerfile << 'EOF'
+FROM alpine:3.19
+
+# Create non-root user
+RUN addgroup -S appgroup -g 1001 && \
+    adduser -S appuser -u 1001 -G appgroup
+
+# Create a test directory owned by appuser
+RUN mkdir -p /app && chown appuser:appgroup /app
+
+USER appuser
+
+WORKDIR /app
+
+CMD ["sh", "-c", "echo 'Running as user:' && id && echo 'Trying to write...' && echo 'hello' > /app/test.txt && echo 'Write to /app succeeded' && echo 'hello' > /etc/test.txt || echo 'Write to /etc BLOCKED (expected)'"]
+EOF
+
+# Build and run
+docker build -t security-test:1.0 .
+docker run --rm security-test:1.0
+```
+
+**Expected output:**
+```
+Running as user:
+uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+Trying to write...
+Write to /app succeeded
+Write to /etc BLOCKED (expected)
+```
+
+`id` = Linux command that shows current user ID, group ID, and group memberships.
+The container is running as UID 1001 — NOT root (UID 0).
+Writing to `/app` (owned by appuser) works.
+Writing to `/etc` (owned by root) fails — as it should.
+
+```bash
+# Compare — see what root does vs non-root
+docker run --rm --user root alpine id
+# uid=0(root) gid=0(root) groups=0(root),1(bin),...
+
+docker run --rm --user 1001 alpine id
+# uid=1001 gid=0(root) groups=0(root)
+```
+
+`--user root` = override the user. Run as root.
+`--user 1001` = run as UID 1001 (even if image runs as root by default).
+
+---
+
+### Lab 2 — Read-Only Filesystem
+
+```bash
+# Run nginx with read-only filesystem
+docker run -d \
+  --name readonly-test \
+  --read-only \
+  --tmpfs /var/cache/nginx \
+  --tmpfs /var/run \
+  --tmpfs /tmp \
+  nginx:alpine
+
+# Verify it started
+docker ps | grep readonly-test
+
+# Try to write inside the container
+docker exec readonly-test sh -c "echo 'test' > /etc/test.txt"
+```
+
+**Expected output:**
+```
+sh: can't create /etc/test.txt: Read-only file system
+```
+
+The filesystem is read-only. No writes allowed.
+
+```bash
+# But tmpfs paths ARE writable
+docker exec readonly-test sh -c "echo 'test' > /tmp/test.txt && cat /tmp/test.txt"
+```
+
+**Expected output:** `test`
+
+tmpfs at `/tmp` is writable (in RAM), but it is temporary.
+
+```bash
+# Verify nginx is actually serving despite read-only
+curl http://localhost:80  # might need to check the port
+docker port readonly-test
+
+# Cleanup
+docker rm -f readonly-test
+```
+
+---
+
+### Lab 3 — Capabilities in Action
+
+```bash
+# Test 1: Try ping without NET_RAW capability
+docker run --rm \
+  --cap-drop ALL \
+  alpine \
+  ping -c 1 8.8.8.8
+```
+
+`--cap-drop ALL` = remove all capabilities including NET_RAW (needed for ping).
+
+**Expected output:**
+```
+PING 8.8.8.8 (8.8.8.8): 56 data bytes
+ping: permission denied (are you root?)
+```
+
+OR simply permission denied — depends on Alpine version.
+
+```bash
+# Test 2: ping WITH NET_RAW capability
+docker run --rm \
+  --cap-drop ALL \
+  --cap-add NET_RAW \
+  alpine \
+  ping -c 1 8.8.8.8
+```
+
+**Expected output:**
+```
+PING 8.8.8.8 (8.8.8.8): 56 data bytes
+64 bytes from 8.8.8.8: seq=0 ttl=118 time=X.X ms
+```
+
+Ping works because we added `NET_RAW` back specifically.
+
+```bash
+# List capabilities of a running container
+docker run -d --name cap-test --cap-drop ALL nginx
+docker inspect cap-test | jq '.[0].HostConfig | {CapAdd, CapDrop}'
+docker rm -f cap-test
+```
+
+---
+
+### Lab 4 — Prove .dockerignore Prevents Secret Leakage
+
+```bash
+cd /home/$USER/docker-labs/security-lab
+
+# Create a fake secret file
+echo "DATABASE_PASSWORD=super_secret_password_123" > .env
+echo "API_KEY=my_private_api_key" >> .env
+
+cat > Dockerfile << 'EOF'
+FROM alpine:3.19
+COPY . /app
+RUN ls -la /app
+CMD ["sh"]
+EOF
+
+# Build WITHOUT .dockerignore
+docker build -t leak-test:no-ignore .
+docker run --rm leak-test:no-ignore cat /app/.env
+```
+
+**Expected output:**
+```
+DATABASE_PASSWORD=super_secret_password_123
+API_KEY=my_private_api_key
+```
+
+The secret was copied into the image! Anyone who pulls this image can read it.
+
+```bash
+# Now create .dockerignore
+cat > .dockerignore << 'EOF'
+.env
+*.env
+*.key
+*.pem
+EOF
+
+# Rebuild WITH .dockerignore
+docker build -t leak-test:with-ignore .
+docker run --rm leak-test:with-ignore cat /app/.env
+```
+
+**Expected output:**
+```
+cat: can't open '/app/.env': No such file or directory
+```
+
+The secret file was excluded from the image. Safe!
+
+```bash
+# Verify what IS in the image
+docker run --rm leak-test:with-ignore ls -la /app
+# Dockerfile is there but .env is NOT
+
+# Cleanup
+docker rmi leak-test:no-ignore leak-test:with-ignore
+rm .env .dockerignore
+```
+
+---
+
+### Lab 5 — Resource Limits in Action
+
+```bash
+# Run a container with strict limits
+docker run -d \
+  --name resource-test \
+  --memory=128m \
+  --cpus=0.5 \
+  --pids-limit=20 \
+  ubuntu \
+  bash -c "while true; do sleep 1; done"
+
+# Verify limits are applied
+docker inspect resource-test | jq '.[0].HostConfig | {
+  Memory,
+  CpuQuota,
+  CpuPeriod,
+  PidsLimit
+}'
+```
+
+**Expected output:**
+```json
+{
+  "Memory": 134217728,
+  "CpuQuota": 50000,
+  "CpuPeriod": 100000,
+  "PidsLimit": 20
+}
+```
+
+`134217728` = 128 * 1024 * 1024 = 128MB in bytes.
+`CpuQuota 50000 / CpuPeriod 100000` = 0.5 CPUs.
+
+```bash
+# Live resource monitoring
+docker stats resource-test
+
+# Attempt a fork bomb — should be limited by pids-limit
+docker exec resource-test bash -c "for i in \$(seq 1 30); do sleep 100 & done; echo 'Started 30 processes'; ps aux | wc -l"
+```
+
+Expected: some processes start but after 20 the kernel refuses to create more.
+
+```bash
+# Cleanup
+docker rm -f resource-test
+```
+
+---
+
+### Lab 6 — Full Secure Container Example
+
+```bash
+cd /home/$USER/docker-labs/security-lab
+
+cat > Dockerfile.secure << 'EOF'
+FROM node:20-alpine
+
+# Non-root user
+RUN addgroup -S -g 1001 appgroup && \
+    adduser -S -u 1001 -G appgroup appuser
+
+WORKDIR /app
+
+# Simple health check endpoint
+COPY --chown=appuser:appgroup <<'APPEOF' server.js
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end(req.url === '/health' ? 'OK' : 'Hello secure world!');
+}).listen(3000, () => console.log('Server running on port 3000'));
+APPEOF
+
+USER appuser
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
+CMD ["node", "server.js"]
+EOF
+
+# Build the secure image
+docker build -f Dockerfile.secure -t secure-app:1.0 .
+
+# Run with all security options
+docker run -d \
+  --name secure-app \
+  --user 1001:1001 \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --no-new-privileges \
+  --memory=128m \
+  --cpus=0.5 \
+  --pids-limit=50 \
+  -p 3000:3000 \
+  secure-app:1.0
+
+# Verify it works
+sleep 3
+curl http://localhost:3000
+curl http://localhost:3000/health
+
+# Verify user inside
+docker exec secure-app id
+# uid=1001(appuser) gid=1001(appgroup)
+
+# Verify filesystem is read-only
+docker exec secure-app sh -c "echo test > /test.txt" 2>&1
+# Read-only file system
+
+# Check resource limits
+docker inspect secure-app | jq '.[0].HostConfig | {Memory, CpuQuota, PidsLimit}'
+
+# Cleanup
+docker rm -f secure-app
+docker rmi secure-app:1.0
+```
+
+---
+
+### Lab 7 — Scan With Trivy and Fix
+
+```bash
+# Scan the official node image
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image node:20 \
+  --severity HIGH,CRITICAL
+
+# Compare with Alpine version (should have fewer vulnerabilities)
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image node:20-alpine \
+  --severity HIGH,CRITICAL
+
+# Scan your own secure-app image
+docker build -f Dockerfile.secure -t secure-app:1.0 .
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image secure-app:1.0 \
+  --severity HIGH,CRITICAL
+```
+
+Compare results. Alpine-based images typically show far fewer vulnerabilities than Debian-based images.
+
+---
+
+## 13. Quick Revision Cheatsheet
+
+| Security Practice | Why | How |
+|------------------|-----|-----|
+| Non-root USER | Limits damage if exploited | `USER appuser` in Dockerfile |
+| Read-only filesystem | Prevents malicious writes | `--read-only` flag |
+| No privileged mode | Prevents host access | Never use `--privileged` |
+| Drop capabilities | Least privilege | `--cap-drop ALL --cap-add NEEDED` |
+| .dockerignore | Prevents secrets in image | List secrets in `.dockerignore` |
+| Image scanning | Find CVEs before deploy | `trivy image myapp:tag` |
+| Secrets management | No credentials in image | Inject at runtime or use secret manager |
+| Resource limits | Prevent DoS | `--memory --cpus --pids-limit` |
+| No-new-privileges | Block privilege escalation | `--no-new-privileges` |
+| AppArmor | Kernel-level access control | Applied by default (`docker-default`) |
+| Seccomp | Block dangerous syscalls | 44 blocked by default |
+
+| Command | What It Does |
+|---------|-------------|
+| `docker run --user 1001:1001 image` | Force run as specific UID:GID |
+| `docker run --read-only image` | Read-only root filesystem |
+| `docker run --tmpfs /tmp image` | RAM-based writable /tmp |
+| `docker run --cap-drop ALL image` | Remove all Linux capabilities |
+| `docker run --cap-add NET_BIND_SERVICE image` | Add specific capability back |
+| `docker run --no-new-privileges image` | Block privilege escalation |
+| `docker run --privileged image` | NEVER do this in production |
+| `docker run --memory=512m image` | Memory limit |
+| `docker run --cpus=1.0 image` | CPU limit |
+| `docker run --pids-limit=100 image` | Process count limit |
+| `trivy image myapp:tag` | Scan for vulnerabilities |
+| `trivy image --severity HIGH,CRITICAL myapp:tag` | Only show serious issues |
+| `trivy image --exit-code 1 --severity CRITICAL myapp:tag` | Fail CI on critical |
+
+| Security Anti-Pattern | Problem | Fix |
+|----------------------|---------|-----|
+| Running as root | Full container control if exploited | `USER appuser` |
+| `--privileged` flag | Near-complete host access | Use specific `--cap-add` |
+| `ENV PASSWORD=secret` | Visible in docker history | Inject at runtime |
+| `COPY .env .` | Credentials in image | Add `.env` to `.dockerignore` |
+| No resource limits | DoS via resource exhaustion | `--memory --cpus --pids-limit` |
+| No image scanning | Unknown CVEs in production | Trivy in CI pipeline |
+| Large base image | More packages = more CVEs | Use alpine or distroless |
+| No `.dockerignore` | Secret files in image | Create comprehensive `.dockerignore` |
+
+---
+
+## 14. Further Reading
+
+- [Docker security overview](https://docs.docker.com/engine/security/) — Official Docker security docs
+- [Docker security best practices](https://docs.docker.com/build/building/best-practices/#security-best-practices) — Official best practices
+- [Linux capabilities man page](https://man7.org/linux/man-pages/man7/capabilities.7.html) — Complete capabilities reference
+- [AppArmor and Docker](https://docs.docker.com/engine/security/apparmor/) — Custom AppArmor profiles
+- [Seccomp and Docker](https://docs.docker.com/engine/security/seccomp/) — Custom seccomp profiles
+- [Trivy documentation](https://aquasecurity.github.io/trivy/) — Full Trivy reference
+- [CIS Docker Benchmark](https://www.cisecurity.org/benchmark/docker) — Industry standard security checklist for Docker
+- [OWASP Docker Security](https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html) — OWASP cheat sheet
+
+---
+
+*File: `docker_security_theory_lab.md` | Topic 7 of 8 | Docker Interview Preparation 2026*
