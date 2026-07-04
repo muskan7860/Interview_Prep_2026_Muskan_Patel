@@ -1,4 +1,4 @@
-# Jenkins Day 5 — Credentials
+# Jenkins Day 7 — Credentials
 ## Theory + Hands-On Lab
 
 ---
