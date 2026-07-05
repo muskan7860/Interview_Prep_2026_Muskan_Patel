@@ -668,7 +668,9 @@ fi
 echo -e "${BLUE}============================================================${NC}"
 echo -e " ${GREEN}Script completed successfully.${NC}"
 echo -e "${BLUE}============================================================${NC}"
+```
 
+---
 ## 13. Lab Instructions — Run on Your Machine
 
 ```bash
