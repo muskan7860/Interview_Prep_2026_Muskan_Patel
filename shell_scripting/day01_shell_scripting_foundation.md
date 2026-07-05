@@ -564,108 +564,61 @@ This is your **first interview-showable, resume-worthy script**. Every single li
 #!/bin/bash
 # ============================================================
 # Script Name : system_info.sh
-# Description : Collects and displays complete server health
-#               information. Used for quick server audits
-#               after provisioning or during incidents.
+# Description : Displays complete server health information
 # Author      : Muskan Patel
-# GitHub      : github.com/muskan7860
-# Created On  : 2026-06-22
-# Version     : 1.0
+# Created On  : 2026-07-05
+# Version     : 2.0 (fixed grep exit code issue)
 # Usage       : ./system_info.sh
 # ============================================================
 
-# --- set -euo pipefail explanation ---
-# set -e  → exit script immediately if ANY command fails
-# set -u  → exit if you use a variable that was never set (catches typos)
-# set -o pipefail → if a pipe like "cmd1 | cmd2" fails, catch that failure
-# Together these make your script SAFE for production
-set -euo pipefail
+# WHY set -eu and NOT pipefail here?
+# set -e  → exit if any command fails
+# set -u  → exit if undefined variable is used
+# We do NOT use -o pipefail here because:
+# grep returns exit code 1 when it finds NOTHING (not an error, just "not found")
+# pipefail would treat that as a script failure and kill the script silently
+# So for commands that may return no results, we use "|| true" to suppress the exit
+set -eu
 
-# --- COLLECT DATA SECTION ---
-# We collect all data first, then display it.
-# $(command) = command substitution: run command, store output in variable
-
-# hostname → prints the machine's hostname
-# On AWS EC2 it looks like: ip-10-0-1-25
-HOSTNAME=$(hostname)
-
-# date '+FORMAT' → formats current date and time
-# %Y = 4-digit year, %m = month, %d = day, %H = hour, %M = minute, %S = second
-CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
-
-# /etc/os-release → a file that Linux uses to identify the OS
-# grep "^PRETTY_NAME" → find the line that starts with PRETTY_NAME
-# cut -d'"' -f2 → split by " character, take 2nd piece (the actual OS name)
-# Example output: Ubuntu 22.04.3 LTS
-OS_INFO=$(grep "^PRETTY_NAME" /etc/os-release | cut -d'"' -f2)
-
-# uname -r → prints the Linux kernel version
-# Example: 5.15.0-1034-aws
-KERNEL_VERSION=$(uname -r)
-
-# uptime -p → prints how long system has been ON in readable English
-# Example: up 3 days, 4 hours, 22 minutes
-UPTIME=$(uptime -p)
-
-# /proc/cpuinfo → virtual file (not real disk file) containing CPU details
-# The Linux kernel writes live data here
-# grep "model name" → find all lines with CPU model info
-# head -1 → take only the first line (multi-core shows same info multiple times)
-# cut -d':' -f2 → everything after the colon
-# xargs → removes leading/trailing whitespace automatically
-CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)
-
-# nproc → prints number of CPU cores available
-# Example: 4
-CPU_CORES=$(nproc)
-
-# uptime → shows load average
-# awk prints field NF-2 (3rd from last), tr removes comma
-# Load average: 3 numbers = system load over last 1 min, 5 min, 15 min
-# If load > number of CPU cores, system is OVERLOADED
-LOAD_AVG=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}' | tr -d ',')
-
-# free -h → shows RAM in human-readable format (GB/MB)
-# awk '/^Mem:/ {print $2}' → find line starting with Mem:, print column 2
-# Columns: total, used, free, shared, buff/cache, available
-TOTAL_RAM=$(free -h | awk '/^Mem:/ {print $2}')
-USED_RAM=$(free -h | awk '/^Mem:/ {print $3}')
-FREE_RAM=$(free -h | awk '/^Mem:/ {print $7}')
-
-# df -h / → disk usage of root filesystem / in human-readable format
-# awk 'NR==2 {...}' → NR=row number. Row 1 is header, row 2 is data.
-# $2=total, $3=used, $4=free, $5=percentage
-DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
-DISK_USED=$(df -h / | awk 'NR==2 {print $3}')
-DISK_FREE=$(df -h / | awk 'NR==2 {print $4}')
-DISK_PCT=$(df -h / | awk 'NR==2 {print $5}')
-
-# hostname -I → prints all IP addresses of this machine
-# awk '{print $1}' → take the first IP only
-IP_ADDRESS=$(hostname -I | awk '{print $1}')
-
-# who | wc -l → who prints each logged-in user on one line
-# wc -l counts lines = number of users currently logged in
-LOGGED_USERS=$(who | wc -l)
-
-# ss -tuln → shows all listening ports
-# grep ':80 ' and ':443 ' → check if web ports are open
-# We use 2>/dev/null to suppress errors if ss is not available
-PORT_80=$(ss -tuln 2>/dev/null | grep ':80 ' | wc -l)
-PORT_443=$(ss -tuln 2>/dev/null | grep ':443 ' | wc -l)
-
-# --- COLOR CODES for nice output ---
+# --- COLOR CODES ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'    # No Color — resets color back to default
+NC='\033[0m'
 
-# --- DISPLAY SECTION ---
-# We now print everything we collected above
+# --- COLLECT DATA ---
 
+HOSTNAME=$(hostname)
+CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+OS_INFO=$(grep "^PRETTY_NAME" /etc/os-release | cut -d'"' -f2)
+KERNEL_VERSION=$(uname -r)
+UPTIME=$(uptime -p)
+CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)
+CPU_CORES=$(nproc)
+LOAD_AVG=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}' | tr -d ',')
+TOTAL_RAM=$(free -h | awk '/^Mem:/ {print $2}')
+USED_RAM=$(free -h | awk '/^Mem:/ {print $3}')
+FREE_RAM=$(free -h | awk '/^Mem:/ {print $7}')
+DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
+DISK_USED=$(df -h / | awk 'NR==2 {print $3}')
+DISK_FREE=$(df -h / | awk 'NR==2 {print $4}')
+DISK_PCT=$(df -h / | awk 'NR==2 {print $5}')
+IP_ADDRESS=$(hostname -I | awk '{print $1}')
+LOGGED_USERS=$(who | wc -l)
+
+# --- PORT CHECK (THE FIX IS HERE) ---
+# grep returns exit code 1 when no match found
+# Without "|| true", set -e would EXIT the script thinking it failed
+# "|| true" means: "if this command fails, that is OK, treat it as success"
+# This is the correct production pattern when a command may return nothing
+
+PORT_80=$(ss -tuln 2>/dev/null | grep ':80 ' | wc -l || true)
+PORT_443=$(ss -tuln 2>/dev/null | grep ':443 ' | wc -l || true)
+
+# --- DISPLAY ---
 echo -e "${BLUE}============================================================${NC}"
-echo -e "${BLUE}           SERVER HEALTH REPORT                            ${NC}"
+echo -e "${BLUE}              SERVER HEALTH REPORT                         ${NC}"
 echo -e "${BLUE}============================================================${NC}"
 echo -e " Report Time       : ${YELLOW}$CURRENT_DATE${NC}"
 echo    "------------------------------------------------------------"
@@ -681,7 +634,7 @@ echo -e "${GREEN} CPU INFORMATION${NC}"
 echo    "------------------------------------------------------------"
 echo    " CPU Model         : $CPU_MODEL"
 echo    " CPU Cores         : $CPU_CORES"
-echo    " Load Average      : $LOAD_AVG  (1min, 5min, 15min)"
+echo    " Load Average      : $LOAD_AVG  (1min 5min 15min)"
 echo    "------------------------------------------------------------"
 echo -e "${GREEN} MEMORY INFORMATION${NC}"
 echo    "------------------------------------------------------------"
@@ -689,7 +642,7 @@ echo    " Total RAM         : $TOTAL_RAM"
 echo    " Used RAM          : $USED_RAM"
 echo    " Available RAM     : $FREE_RAM"
 echo    "------------------------------------------------------------"
-echo -e "${GREEN} DISK INFORMATION  (Root Partition /)"
+echo -e "${GREEN} DISK INFORMATION (Root Partition /)${NC}"
 echo    "------------------------------------------------------------"
 echo    " Total Disk        : $DISK_TOTAL"
 echo    " Used Disk         : $DISK_USED"
@@ -700,28 +653,21 @@ echo -e "${GREEN} NETWORK & USERS${NC}"
 echo    "------------------------------------------------------------"
 echo    " Logged-in Users   : $LOGGED_USERS"
 
-# Show port status with colored OK/CLOSED
 if [ "$PORT_80" -gt 0 ]; then
-    echo -e " Port 80 (HTTP)    : ${GREEN}LISTENING${NC}"
+    echo -e " Port 80  (HTTP)   : ${GREEN}LISTENING${NC}"
 else
-    echo -e " Port 80 (HTTP)    : ${RED}NOT LISTENING${NC}"
+    echo -e " Port 80  (HTTP)   : ${RED}NOT LISTENING${NC}"
 fi
 
 if [ "$PORT_443" -gt 0 ]; then
     echo -e " Port 443 (HTTPS)  : ${GREEN}LISTENING${NC}"
 else
-    echo -e " Port 443 (HTTPS)  : ${YELLOW}NOT LISTENING${NC}"
+    echo -e " Port 443 (HTTPS)  : ${YELLOW}NOT LISTENING (normal if no web server)${NC}"
 fi
 
-echo    "------------------------------------------------------------"
-
-# $? here will be 0 because the last command (echo) succeeded
 echo -e "${BLUE}============================================================${NC}"
-echo    " Script completed. Exit Status: $?"
+echo -e " ${GREEN}Script completed successfully.${NC}"
 echo -e "${BLUE}============================================================${NC}"
-```
-
----
 
 ## 13. Lab Instructions — Run on Your Machine
 
