@@ -1,7 +1,7 @@
 # Kubernetes Config & Secrets — Deep Dive Concept + Hands-On Lab
 ## ConfigMap · Secret · Env Injection · Volume Mount · Sealed Secrets · External Secrets
 > Written for: Someone with 4 years of DevOps experience preparing for senior-level interviews
-> Style: First-standard student explanation → deep technical truth → hands-on lab with line-by-line explanation
+
 
 ---
 
