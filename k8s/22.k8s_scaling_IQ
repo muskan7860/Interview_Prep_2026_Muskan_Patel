@@ -1,0 +1,406 @@
+# Kubernetes Scaling — Interview Questions & Answers
+## HPA · VPA · Cluster Autoscaler · Resource Requests & Limits
+> Target: 4 Years DevOps Experience | Senior-Level Interviews
+> Style: Easy to memorize + Professional to say out loud
+> Tricky questions marked with ⚠️
+
+---
+
+## 💡 HOW TO USE THIS FILE
+
+- Read the question first
+- Try answering in your own words
+- Then read the answer — written to say out loud in an interview
+- Banking/production examples included — use them naturally
+
+---
+
+## SECTION A — RESOURCE REQUESTS AND LIMITS
+
+---
+
+### Q1. What is the difference between resource requests and resource limits?
+
+**Answer:**
+
+> "Requests and limits serve two completely different purposes even though they're defined together.
+>
+> A resource request is the MINIMUM guaranteed amount of CPU or memory for a container. The Kubernetes Scheduler reads requests to decide which node can host a pod. If no node has enough unreserved CPU or memory matching the request — the pod stays Pending. Once scheduled, the pod is guaranteed at least this much resource even if the node is busy.
+>
+> A resource limit is the MAXIMUM amount the container can ever use. The Linux kernel enforces this hard ceiling. For CPU — if the container tries to use more than the limit, the kernel throttles it — slows it down but doesn't kill it. For memory — if the container tries to allocate more than the limit, the kernel kills the process with SIGKILL, exit code 137, which shows up as OOMKilled in Kubernetes.
+>
+> The practical summary: requests affect scheduling decisions (where does the pod go). Limits affect runtime behavior (what happens if the pod uses too much). You should always set both — requests for correct scheduling, limits to protect the node from runaway pods."
+
+---
+
+### Q2. ⚠️ What is the difference between CPU throttling and OOMKill? Why does memory kill but CPU doesn't?
+
+**Answer:**
+
+> "This is a fundamental difference in how Linux handles the two resource types.
+>
+> CPU is a time-based resource. When a container hits its CPU limit, the Linux kernel's cgroup scheduler simply stops giving that container CPU time for a fraction of each cycle. The container process is still running — it's just waiting for CPU time. It runs slower. The application experiences higher latency but doesn't crash. The pod stays Running. This is called CPU throttling.
+>
+> Memory is a space-based resource. When a container tries to allocate memory beyond its limit, there is no 'run slower' option — you either have the bytes or you don't. The kernel's OOM killer activates and sends SIGKILL to the largest offending process in that memory cgroup. The process dies immediately with exit code 137. Kubernetes sees the container exited and the pod shows OOMKilled in its status.
+>
+> Practical implication: CPU limit violations are silent performance problems. Your app seems slow and you might not know why until you check throttling metrics. Memory limit violations are loud and immediate — your pod crashes and you get a clear OOMKilled signal. CPU throttling is often more dangerous because it's invisible, while OOMKill at least tells you something is wrong."
+
+---
+
+### Q3. ⚠️ What are QoS classes? Which pods get evicted first under memory pressure?
+
+**Answer:**
+
+> "QoS — Quality of Service — classes determine the eviction priority when a node runs low on memory. Kubernetes assigns them automatically based on your requests and limits settings.
+>
+> Guaranteed class: every container in the pod has requests equal to limits for both CPU and memory. These pods are evicted last — they have the highest priority. Use this for databases and critical services.
+>
+> Burstable class: at least one container has a request lower than its limit, or only one of the two is set. These pods are evicted second. Most application pods fall here.
+>
+> BestEffort class: no requests and no limits set on any container. These pods are evicted first — they have the lowest priority. Kubernetes can kill them any time memory is needed.
+>
+> The eviction order under pressure: BestEffort first, then Burstable, then Guaranteed last. This is why setting no resource requests and limits in production is dangerous — your pod gets the BestEffort class and can be killed by the system at any moment. In our banking project, all production pods were at minimum Burstable, and all database pods were Guaranteed."
+
+---
+
+### Q4. ⚠️ A pod is stuck in Pending with "Insufficient CPU". The node appears to have CPU available. What is happening?
+
+**Answer:**
+
+> "This is the requests vs actual usage confusion. The Scheduler makes decisions based on REQUESTS — not actual usage.
+>
+> Example: Node has 4 CPU cores. Pods on it have requested a total of 3.8 CPU. Actual CPU usage is only 1.2 CPU because pods are idle. To the Scheduler, the node has only 0.2 CPU 'free' (based on requests). Your new pod requests 0.5 CPU — Scheduler sees no node has 0.5 free — pod is Pending.
+>
+> This is called overcommitting on requests — your pods have reserved more than they use. The fix is to audit your pods' actual CPU usage with `kubectl top pods` and compare it to their requests. If pods consistently use 100m but request 500m, reduce requests to 150m (with some headroom). This frees up scheduler capacity while still protecting the pod's guaranteed minimum.
+>
+> `kubectl describe node` shows the Allocated resources section with both requests percentages and limits percentages. If requests are near 100% but actual usage is low — that's the diagnosis. Fix: right-size requests based on actual usage data, which is where VPA recommendations help."
+
+---
+
+### Q5. What happens if you set limits but NOT requests?
+
+**Answer:**
+
+> "If you set only limits with no requests, Kubernetes automatically sets the request equal to the limit. A pod with only `limits: cpu: 500m` gets `requests: cpu: 500m` implicitly — making it Guaranteed QoS.
+>
+> This seems fine but has a subtle problem: you're telling the Scheduler this pod needs 500m CPU guaranteed, even if your app normally only uses 50m. If your actual usage is much lower than the limit you set, you're wasting scheduler capacity — nodes look full when they're not.
+>
+> The correct pattern is to set requests to your typical usage and limits to your maximum acceptable usage. `requests: 100m, limits: 500m` means the Scheduler reserves 100m per pod (right-sizing) but the pod can burst to 500m when the node has capacity.
+>
+> Always set both explicitly. Don't rely on the implicit behavior — it's a common mistake that leads to overprovisioned scheduling and underutilized nodes."
+
+---
+
+## SECTION B — HORIZONTAL POD AUTOSCALER
+
+---
+
+### Q6. How does HPA work? Walk through the scaling math.
+
+**Answer:**
+
+> "HPA runs a control loop every 15 seconds. It reads the current metric value from the metrics API, compares it to the target, and calculates how many replicas are needed.
+>
+> The formula is: desired replicas = ceiling of (current replicas multiplied by current metric divided by target metric).
+>
+> Concrete example: 3 pods running, target CPU is 50%, current average CPU is 90%. Desired = ceiling(3 × 90/50) = ceiling(5.4) = 6. HPA sets the deployment to 6 replicas.
+>
+> Scale down example: those 6 pods are now handling the load, CPU drops to 20%. Desired = ceiling(6 × 20/50) = ceiling(2.4) = 3. But HPA waits for the stabilization window (default 5 minutes for scale down) before actually scaling down — to avoid thrashing if traffic bounces back.
+>
+> The ceiling function ensures you always round UP — you'd rather have one extra pod than be under-provisioned. HPA never goes below minReplicas or above maxReplicas regardless of what the math says."
+
+---
+
+### Q7. What does HPA need to work? What is metrics-server?
+
+**Answer:**
+
+> "HPA needs three things to work correctly.
+>
+> First, metrics-server must be installed in the cluster. metrics-server is a lightweight aggregator that collects CPU and memory usage from kubelet on every node and exposes it through the Kubernetes metrics API at `/apis/metrics.k8s.io`. Without it, HPA cannot read any metrics and shows `<unknown>` in the TARGETS column — it does nothing.
+>
+> Second, pods must have resource REQUESTS set. HPA measures CPU as a percentage of the request — not a percentage of the node's total CPU. If a pod has no CPU request, HPA cannot calculate 'what percentage is it using' and fails with an error. The request is the baseline that makes the percentage meaningful.
+>
+> Third, the target must be a scalable workload — Deployment, StatefulSet, or ReplicaSet. HPA cannot scale standalone pods.
+>
+> Common mistake: installing HPA, setting minReplicas and maxReplicas, but forgetting to install metrics-server. Everything looks configured but nothing scales. Always verify with `kubectl top pods` — if that works, metrics-server is working and HPA can read metrics."
+
+---
+
+### Q8. ⚠️ What is the stabilization window in HPA? Why is it important?
+
+**Answer:**
+
+> "The stabilization window is a time buffer that HPA checks before scaling down. It prevents a problem called thrashing — where HPA constantly scales up and down in rapid cycles.
+>
+> Without a stabilization window: traffic spikes → HPA scales to 10 pods → 10 pods handle the traffic easily → CPU drops to 5% → HPA immediately scales down to 2 pods → 2 pods can't handle remaining traffic → CPU spikes → HPA scales up again. This cycle repeats every few minutes, causing constant pod creation and deletion.
+>
+> With a stabilization window: when HPA wants to scale down, it looks backward at the last N seconds (default 300 seconds = 5 minutes) of metric history. It only scales down if the MINIMUM desired replica count during that entire window justifies the reduction. If traffic bounced back even once in those 5 minutes — no scale down.
+>
+> For scale UP the stabilization window defaults to 0 — react immediately to traffic increases. For scale DOWN it defaults to 300 seconds — be cautious before removing pods.
+>
+> In our banking project during end-of-month processing, traffic spikes lasted exactly 15-20 minutes then dropped. Without stabilization window, pods would be removed 5 minutes into the spike before it was over. We set the scale-down window to 30 minutes so pods stayed available for the full processing window."
+
+---
+
+### Q9. What are custom metrics in HPA? Give a real example.
+
+**Answer:**
+
+> "Custom metrics let you scale on business-relevant signals instead of just CPU and memory. CPU-based scaling has a fundamental problem: it's a proxy metric. High CPU might mean your app is doing useful work — or it might mean it's garbage collecting. Low CPU doesn't necessarily mean low load.
+>
+> Better signals are often: HTTP requests per second, queue depth, active connections, database query rate, or any metric your application exposes.
+>
+> For custom metrics to work with HPA, you need a Prometheus Adapter or similar component installed. The adapter reads metrics from Prometheus and exposes them through the custom metrics API that HPA can read.
+>
+> Real example from our banking project: our payment processing pods consumed from an SQS queue. CPU was always low — the work was I/O bound, not CPU bound. So CPU-based HPA didn't scale even during peak hours. We switched to scaling on SQS queue depth using the External Metrics API. Target: 30 messages per pod. When the queue grew beyond 30 × current pod count, HPA added more pods. Pods processed faster, queue emptied, HPA scaled down. This was directly tied to actual business load — messages waiting to be processed."
+
+---
+
+### Q10. ⚠️ HPA shows `<unknown>` for targets. What is wrong and how do you fix it?
+
+**Answer:**
+
+> "The `<unknown>` in the TARGETS column means HPA cannot read the metric value. Three possible causes.
+>
+> First and most common: metrics-server is not installed or not working. Test with `kubectl top pods`. If this command fails with 'server could not find the requested resource' — metrics-server is not installed or not running. Install it, wait for it to become Ready, and HPA targets should populate within a minute.
+>
+> Second: the pods have no resource requests set. HPA needs requests to calculate CPU percentage. Check with `kubectl describe deployment <name>` and look at the Resources section. If it shows none — add requests to the deployment.
+>
+> Third: the Deployment has 0 replicas. HPA can't measure average CPU across 0 pods. Ensure at least minReplicas pods are running.
+>
+> Diagnostic commands: `kubectl describe hpa <name>` — the Conditions and Events sections show exactly why HPA is not working. Look for conditions like `AbleToScale: False` or `ScalingActive: False` with reason messages that tell you the specific problem."
+
+---
+
+## SECTION C — VERTICAL POD AUTOSCALER
+
+---
+
+### Q11. What is VPA and how is it different from HPA?
+
+**Answer:**
+
+> "HPA and VPA solve different sizing problems.
+>
+> HPA answers: 'How many pods do I need?' It scales the replica count — adding or removing pod instances based on load. All pods remain the same size; you just have more or fewer of them.
+>
+> VPA answers: 'How big should each pod be?' It adjusts the CPU and memory requests (and limits) of each pod based on actual historical usage. Instead of three small pods you might have one correctly-sized pod.
+>
+> When to use VPA over HPA: for workloads that can't scale horizontally — a single-instance database, a singleton process, a stateful application where multiple instances cause data conflicts. You can't run two leaders of the same database, but you can give the one database pod more memory.
+>
+> When to use both: HPA for pod count scaling on custom metrics, VPA in Off or Initial mode to recommend right-sizing. Use VPA's recommendations to set correct requests, then let HPA handle count scaling.
+>
+> Key limitation of VPA: it requires pod restart to apply new resource values. In Auto mode, VPA actively evicts your pod to recreate it with new resources. This causes brief downtime for single-replica deployments."
+
+---
+
+### Q12. What are VPA update modes? Which is safest to start with?
+
+**Answer:**
+
+> "VPA has four update modes that control how aggressively it applies recommendations.
+>
+> Off mode: VPA watches the pods and calculates recommendations but does NOTHING. The recommendations appear in the VPA object's status section. Zero impact on running pods. This is the safest starting point — you see what VPA would do without any actual changes. I always start here when first deploying VPA on existing workloads.
+>
+> Initial mode: VPA only applies recommendations when a pod is FIRST created or naturally recreated. It does not actively evict running pods. If a pod restarts due to a crash or rolling update, the new pod starts with the recommended resources. Good step two after Off — see recommendations take effect gradually.
+>
+> Recreation mode: same as Initial but VPA waits for natural restart events. In practice behaves similarly to Initial.
+>
+> Auto mode: VPA actively evicts pods when the current resources differ significantly from recommendations. The new pod starts with recommended values. Most powerful but causes unexpected pod restarts. Never use Auto mode on single-replica deployments — it will evict your only pod, causing downtime.
+>
+> My recommendation: start with Off mode for a week, review recommendations, validate they make sense, then move to Initial mode. Only use Auto for non-critical workloads with multiple replicas."
+
+---
+
+### Q13. ⚠️ Can you run HPA and VPA together on the same deployment?
+
+**Answer:**
+
+> "Yes and no — it depends on which metrics each is using.
+>
+> The dangerous combination: HPA scaling on CPU utilization AND VPA adjusting CPU requests. This creates a feedback loop. VPA increases CPU requests → CPU utilization percentage drops (same actual usage, higher request baseline) → HPA thinks load decreased → HPA scales down pods → fewer pods, more load per pod → CPU utilization rises → HPA scales up → CPU utilization drops → HPA scales down. They fight each other in a loop that never stabilizes.
+>
+> The safe combination: HPA scaling on CUSTOM METRICS like requests per second or queue depth, AND VPA managing CPU and memory right-sizing. They operate on completely independent signals. HPA doesn't touch resource values, VPA doesn't touch replica count. No conflict.
+>
+> Another safe combination: VPA in Off or Initial mode (only recommends, doesn't change running pods) with HPA on CPU. VPA gives you right-sizing recommendations that you apply manually to your YAML. HPA then handles count scaling on correctly-sized pods.
+>
+> In our banking project, we ran HPA on queue depth and VPA in Off mode. We reviewed VPA recommendations monthly and updated our deployment YAMLs with the suggested request values. Clean separation, no conflicts."
+
+---
+
+## SECTION D — CLUSTER AUTOSCALER
+
+---
+
+### Q14. What does Cluster Autoscaler do? When does it add a node?
+
+**Answer:**
+
+> "Cluster Autoscaler automatically adds or removes virtual machine nodes from the cluster based on pod scheduling needs and node utilization.
+>
+> It adds a node when: there are pods in Pending state that failed to schedule due to insufficient resources on existing nodes. CA runs a simulation — 'if I add a node of type X, would these pending pods be able to schedule?' If yes, it calls the cloud provider API to provision a new VM, adds it to the cluster, and the Scheduler then places the pending pods on it.
+>
+> It removes a node when: a node has been underutilized for a configurable period (default 10 minutes), all pods on it could be moved to other existing nodes, and no PodDisruptionBudget or annotation prevents eviction. CA drains the node (evicts all pods), then terminates the cloud VM.
+>
+> CA doesn't add nodes preemptively — it reacts to actual pending pods. This means there's a delay between load increasing (HPA adds pods) and new nodes being available (CA provisions them). Node boot time in AWS is typically 2-3 minutes. During this window, pods are Pending. For latency-sensitive applications, keep some buffer in your min node count or use node warm pools."
+
+---
+
+### Q15. ⚠️ What is a PodDisruptionBudget and why is it important with Cluster Autoscaler?
+
+**Answer:**
+
+> "A PodDisruptionBudget is a policy that tells Kubernetes how many pods of a set can be unavailable at any given time during voluntary disruptions. CA node drain is a voluntary disruption.
+>
+> Without a PDB, CA can drain a node and move all pods to other nodes simultaneously. If you have 3 replicas of a payment service and all happen to be on the node being drained, CA might try to evict all 3 at once. All 3 pods are being restarted at the same time — your service is completely down during those seconds.
+>
+> With a PDB of `minAvailable: 2`, CA knows it cannot reduce payment pods below 2. It evicts pods one at a time, waiting for each to restart and become Ready on another node before evicting the next. At most 1 pod is unavailable at any moment. Zero-downtime node removal.
+>
+> CA fully respects PDBs — it won't drain a node if doing so would violate any PDB. If a node has pods that would violate their PDB if evicted, CA marks that node as 'not removable' and looks for other nodes to remove instead.
+>
+> In our banking project, every Deployment with 2+ replicas had a PDB with `maxUnavailable: 1`. This meant Cluster Autoscaler could do node maintenance and cost optimization without any service downtime. Without PDBs, a maintenance window that removed 3 nodes could briefly take down multiple services."
+
+---
+
+### Q16. ⚠️ Cluster Autoscaler is not removing a node that looks empty. Why?
+
+**Answer:**
+
+> "Several reasons why CA won't remove a node even when it looks underutilized.
+>
+> Most common: a pod on that node cannot be evicted. Reasons include: the pod has no controller — it's a standalone pod, not managed by a Deployment or StatefulSet. CA never evicts standalone pods because they won't be recreated elsewhere. Check with `kubectl get pods -o wide` on that node and look for pods without an owner reference.
+>
+> Second reason: a pod on that node has PodDisruptionBudget constraints that prevent eviction right now. If the service is at minimum available replicas already, the PDB blocks eviction.
+>
+> Third reason: a pod uses local storage — hostPath or emptyDir with actual data. CA by default won't remove nodes with local storage pods unless `--skip-nodes-with-local-storage=false` is set.
+>
+> Fourth reason: the node has the annotation `cluster-autoscaler.kubernetes.io/scale-down-disabled=true`. Check with `kubectl describe node <name>` and look in the Annotations section.
+>
+> Fifth reason: the scale-down-unneeded-time hasn't passed yet. CA requires a node to be underutilized for a sustained period (default 10 minutes) before removing it.
+>
+> Diagnostic: check CA logs directly — `kubectl logs -n kube-system -l app=cluster-autoscaler`. CA logs explain exactly why each node is or is not being removed."
+
+---
+
+### Q17. What is the `expander` in Cluster Autoscaler and what does `least-waste` mean?
+
+**Answer:**
+
+> "The expander is CA's strategy for choosing WHICH node group to scale up when multiple node groups could satisfy a pending pod's requirements.
+>
+> Imagine you have three node groups: t3.medium (2 CPU, 4GB), m5.large (2 CPU, 8GB), m5.xlarge (4 CPU, 16GB). A pending pod needs 1 CPU and 1GB memory. All three node types can satisfy this. Which one does CA add?
+>
+> `least-waste`: CA calculates how much resource would be wasted (allocated but not used by the pending pod) if it adds each node type. It picks the node type that minimizes waste. For a pod needing 1CPU/1GB: a t3.medium wastes 1CPU/3GB, an m5.xlarge wastes 3CPU/15GB. CA picks t3.medium — less waste.
+>
+> Other expanders: `random` — picks randomly, simple but not cost-optimal. `most-pods` — picks the node that would allow the most pending pods to schedule. `priority` — uses a priority list you configure. `price` — picks the cheapest node that works (needs pricing API).
+>
+> In our banking cluster, we used `least-waste` for general workloads and `priority` to ensure GPU nodes were only added when specifically needed — regular pods shouldn't land on expensive GPU machines."
+
+---
+
+## SECTION E — PUTTING IT ALL TOGETHER
+
+---
+
+### Q18. ⚠️ Describe a complete auto-scaling scenario from traffic spike to scale-down.
+
+**Answer:**
+
+> "Let me walk through a real banking scenario we handled.
+>
+> Normal state: payment service running 3 pods on 2 nodes. HPA target is 50% CPU. VPA in Initial mode has right-sized pods to requests: 500m CPU, 512Mi memory.
+>
+> 5 PM Friday — salary day in India — traffic spike. 50,000 payment requests per second instead of normal 5,000.
+>
+> Step 1: HPA detects CPU jumped to 85% across all pods. Formula: ceiling(3 × 85/50) = ceiling(5.1) = 6 replicas. HPA sets Deployment to 6 replicas.
+>
+> Step 2: Scheduler tries to place 3 new pods. Both nodes are near capacity — each node can only fit 1 more pod. After placing 2 new pods, the 6th pod is Pending.
+>
+> Step 3: Cluster Autoscaler detects pending pod. Simulates adding a t3.xlarge node. Pod would schedule. CA calls AWS API — new EC2 instance starts. Takes 2.5 minutes.
+>
+> Step 4: New node joins, 6th pod schedules. All 6 pods running. CPU drops to 40%. System stable.
+>
+> 7 PM — traffic normalizes. CPU drops to 10%.
+>
+> Step 5: HPA sees 10% CPU. Formula: ceiling(6 × 10/50) = ceiling(1.2) = 2. But stabilization window is 300 seconds — HPA waits 5 minutes to confirm load is consistently low.
+>
+> Step 6: After 5 minutes still at 10%. HPA scales down 6→3 pods (minReplicas=3 for availability).
+>
+> Step 7: Third node now only has 1 pod. CA checks: underutilized for 10+ minutes. Can that pod fit on nodes 1 or 2? Yes. CA drains node 3 (PDB ensures payment pods aren't all evicted simultaneously). CA terminates the EC2 instance.
+>
+> Total: automatic scale from 3 pods/2 nodes to 6 pods/3 nodes and back to 3 pods/2 nodes — no human intervention."
+
+---
+
+### Q19. ⚠️ How do you right-size resource requests for a new application you've never run before?
+
+**Answer:**
+
+> "Right-sizing a new application before you have production data is a common challenge. My approach is iterative.
+>
+> Start conservative: deploy to a dev/staging environment with generous initial resources. For a typical Java microservice: requests: cpu 250m, memory 512Mi; limits: cpu 1000m, memory 1Gi. The limits protect other pods, the requests are just initial guesses.
+>
+> Then observe. Install VPA in Off mode. Run load tests simulating realistic traffic. Use `kubectl top pods` to see actual usage during different load levels. After a week of data, check the VPA recommendations — they reflect the 90th percentile usage, giving you good headroom.
+>
+> In production, continue with VPA in Off mode for the first month. Review recommendations weekly. If VPA consistently recommends 600Mi memory but pods have 512Mi requests — you're close to OOMKill risk, increase requests.
+>
+> For Java applications specifically: Java heap size is set with -Xmx in JVM flags. Set memory limit to JVM heap + 25% overhead. A Java app with -Xmx 1g needs at least 1.25Gi memory limit (heap + metaspace + thread stacks + JVM overhead).
+>
+> Red flags requiring immediate adjustment: pod OOMKilled in describe (memory too low), kubectl top showing actual usage consistently above 80% of request (about to hit limit), CrashLoopBackOff with OOMKill reason."
+
+---
+
+## SECTION F — QUICK FIRE QUESTIONS
+
+| Question | Answer |
+|----------|--------|
+| What does HPA scale? | Pod count (replicas) |
+| What does VPA scale? | Pod resource sizes (CPU/memory requests) |
+| What does Cluster Autoscaler scale? | Node count (VMs) |
+| What is CPU throttling? | Pod runs slower when hitting CPU limit — does NOT crash |
+| What is OOMKill? | Pod killed when hitting memory limit — exit code 137 |
+| Which is harder — CPU limit or memory limit? | Memory is hard (kills). CPU is soft (throttles). |
+| What is Guaranteed QoS? | requests == limits for all containers — evicted last |
+| What is BestEffort QoS? | No requests or limits — evicted first |
+| HPA formula? | CEIL(current replicas × current metric / target metric) |
+| What does HPA need to function? | metrics-server installed + resource requests set on pods |
+| Default HPA scale-down stabilization window? | 300 seconds (5 minutes) |
+| Default HPA scale-up stabilization window? | 0 seconds (immediate) |
+| HPA shows `<unknown>` — first thing to check? | Is metrics-server installed and working? |
+| `kubectl top pods` fails — what does it mean? | metrics-server not installed or not ready |
+| Can HPA and VPA coexist? | Yes — if they use different metrics (e.g., HPA on RPS, VPA on CPU/memory) |
+| VPA updateMode: Off does what? | Shows recommendations only — no changes to pods |
+| VPA updateMode: Auto does what? | Actively evicts pods to apply new resource recommendations |
+| When does CA add a node? | When pods are Pending due to insufficient node resources |
+| When does CA remove a node? | When a node is underutilized for longer than scale-down-unneeded-time |
+| What is PodDisruptionBudget? | Policy: minimum pods that must stay running during voluntary disruptions |
+| Does CA respect PDB? | ✅ Yes — won't drain a node if eviction violates PDB |
+| What prevents CA from removing a specific node? | annotation cluster-autoscaler.kubernetes.io/scale-down-disabled=true |
+| What is `least-waste` expander? | CA picks node type that wastes least resources for pending pod |
+| CA scale-down delay default? | 10 minutes underutilized before node removal |
+| 1 CPU = how many millicores? | 1000m (millicores) |
+| Units for memory in Kubernetes? | Mi (Mebibyte), Gi (Gibibyte) — use these, not M or G |
+| What is overcommitting? | When total pod limits exceed node capacity |
+| Is overcommitting requests OK? | ❌ No — pods stay Pending if requests are overcommitted |
+| Is overcommitting limits OK? | ✅ Yes — limits can exceed node capacity (pods share burst capacity) |
+
+---
+
+## SECTION G — THINGS THAT SOUND IMPRESSIVE IN AN INTERVIEW
+
+1. **"The most dangerous scaling mistake I've seen is CPU throttling being invisible. Memory OOMKill shows up immediately — you see the crash, fix the limit, done. But CPU throttling just makes your service slow. Response times increase, SLA is violated, and you don't realize why until you check throttling metrics in Prometheus. We added a CPU throttling alert that fires when any pod has more than 25% throttled CPU time for 5+ minutes. Found three services that had been silently throttled for weeks."**
+
+2. **"We had a Cluster Autoscaler that refused to remove what looked like empty nodes. After 20 minutes debugging, I found standalone pods — pods without a Deployment controller — running on those nodes from a developer who ran `kubectl run` for testing and forgot to delete them. CA won't evict standalone pods because they can't be recreated. Lesson: never use kubectl run without `--restart=Never --rm` in shared clusters. We added a policy that auto-deletes standalone pods older than 1 hour."**
+
+3. **"In our banking payment service, CPU-based HPA was not effective because the workload was I/O bound — waiting for database responses, not burning CPU. CPU was always low even under heavy load. We switched to scaling on `http_requests_per_second` custom metric via Prometheus Adapter. Set the target to 100 RPS per pod. Now the scale-up is directly tied to actual client request volume. Response time SLA improved by 40% during peak hours."**
+
+4. **"VPA in production requires careful thought about update mode. We run VPA in Initial mode for all stateful services — new pods get right-sized resources, but running pods are never evicted by VPA. For stateless services with 3+ replicas, we use Auto mode. We found that VPA Auto mode actually reduced our AWS EC2 costs by 18% — it was right-sizing pods that had been over-provisioned by developers who set 'safe' high values when they first deployed."**
+
+5. **"The three autoscalers form a complete system but they operate at different speeds. HPA reacts in 15-30 seconds. Cluster Autoscaler provisions a node in 2-3 minutes. During that window, new pods from HPA are Pending. For truly latency-sensitive workloads, we used overprovisioning — running low-priority placeholder pods that consume no real resources but reserve node capacity. When real pods need space, the placeholders get evicted instantly (they're BestEffort) and real pods schedule without waiting for CA to provision a node."**
+
+---
+
+*File: K8s_Scaling_Interview_Questions.md*
+*Repository: Interview_Preparation_2026 → Kubernetes/*
+*Companion file: K8s_Scaling_Concept_and_Lab.md*
